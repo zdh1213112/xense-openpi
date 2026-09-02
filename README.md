@@ -219,16 +219,6 @@ absolute paths from `weight_loader.params_path` (e.g. `/home/<you>/...`). Use
 upstream URLs (`gs://openpi-assets/...`) or paths that every contributor can
 resolve.
 
-If you need to add a brand-new model class or data factory, register its string
-name in [`src/openpi/training/registry.py`](src/openpi/training/registry.py)
-first — then any YAML can reference it via `type: <YourClass>`.
-
-#### Updating shared examples after editing `config.py`
-
-If you changed something in `_CONFIGS` that has a corresponding YAML in
-`configs/_examples/`, regenerate the YAMLs and re-run the equivalence test:
-
-```bash
 python scripts/migrate_configs_to_yaml.py --overwrite
 pytest src/openpi/training/yaml_examples_equivalence_test.py
 ```
@@ -640,6 +630,15 @@ python -m examples.bi_flexiv_rizon4_rt.main \
     --args.bi-mount-type forward \
     --args.inner-control-hz 1000 \
     --args.interpolate-cmds \
+    --args.runtime-hz 30 \
+    --args.rtc-enabled \
+    --args.dry-run
+
+# BiDobot Nova5 DH dry-run inference with RTC enabled
+python -m examples.bi_dobot_nova5_dh.main \
+    --args.host 192.168.142.220 \
+    --args.port 8000 \
+    --args.control-frequency 100 \
     --args.runtime-hz 30 \
     --args.rtc-enabled \
     --args.dry-run

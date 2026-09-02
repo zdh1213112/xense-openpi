@@ -506,6 +506,20 @@ class LeRobotBiFlexivDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotBiDobotNova5DHDataConfig(LeRobotBiFlexivDataConfig):
+    """
+    Data config for BiDobot Nova5 DH dual-arm robot in LeRobot format.
+
+    This robot uses the same policy-facing 20D Cartesian layout as
+    LeRobotBiFlexivDataConfig:
+        left_tcp.{x, y, z, r1-r6} (9D) + right_tcp.{x, y, z, r1-r6} (9D)
+        + left_gripper.pos (1D) + right_gripper.pos (1D).
+
+    Cameras: head, left_wrist, right_wrist.
+    """
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -930,6 +944,30 @@ _CONFIGS = [
         num_train_steps=60_000,
         num_workers=64,
         fsdp_devices=8,
+    ),
+    TrainConfig(
+        name="pi05_loreal",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            discrete_state_input=True,
+            enable_training_time_rtc=True,
+            max_token_len=200,
+        ),
+        data=LeRobotBiDobotNova5DHDataConfig(
+            repo_id="Xense/loreal_returns_sorting_0717",
+            use_delta_cartesian_actions=True,
+            default_prompt="Pick up the returned cosmetic product, scan its barcode, and place it into the return cart.",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        ema_decay=None,
+        batch_size=32,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        num_workers=8,
+        fsdp_devices=1,
+        checkpoint_base_dir="/root/autodl-fs/shilin/zdh",
     ),
     TrainConfig(
         name="debug_pi05",
