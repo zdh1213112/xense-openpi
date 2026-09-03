@@ -8,8 +8,9 @@
 - 状态和动作（10D）：`tcp.x/y/z`、`tcp.r1-r6`、`gripper.pos`
 - 控制模式：`ControlMode.CARTESIAN_MOTION`
 
-推理所用 checkpoint 必须由相同的 10D 字段顺序和 `head`/`wrist` 相机键训练。旧的双臂
-checkpoint 是 20D，并且使用 `head`/`left_wrist`/`right_wrist`，不能直接用于此客户端。
+本项目中的 `LeRobotDobotNova5DataConfig` 与该 10D 字段及相机契约一致。旧的双臂
+`LeRobotBiDobotNova5DHDataConfig` 是 20D，并且使用
+`head`/`left_wrist`/`right_wrist`，不能直接用于此客户端。
 
 ## 依赖
 
@@ -21,13 +22,13 @@ export PYTHONPATH=/home/zdh/loreal/loreal_lerobot/src:$PYTHONPATH
 
 ## 启动策略服务
 
-在策略机器上运行，并替换训练配置和 checkpoint 路径：
+在策略机器上运行，并替换 checkpoint 路径：
 
 ```bash
 cd /home/zdh/xense-openpi
 mamba run -n lerobot-xense-v4 python scripts/serve_policy.py \
     policy:checkpoint \
-    --policy.config=<single_arm_train_config> \
+    --policy.config=pi05_base_dobot_nova5_loreal_returns_sorting_0831 \
     --policy.dir=<checkpoint_step_path>
 ```
 

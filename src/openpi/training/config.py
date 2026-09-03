@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.bi_flexiv_policy as bi_flexiv_policy
+import openpi.policies.dobot_nova5_policy as dobot_nova5_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.xense_flare_policy as xense_flare_policy
 import openpi.shared.download as _download
@@ -520,6 +521,57 @@ class LeRobotBiDobotNova5DHDataConfig(LeRobotBiFlexivDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotDobotNova5DataConfig(DataConfigFactory):
+    """Data config for the single right-arm Dobot Nova5 DH in LeRobot format.
+
+    State/action layout (10D): ``tcp.{x,y,z,r1-r6}`` followed by
+    ``gripper.pos``. Cameras are ``head`` and ``wrist``. This matches both the
+    ``dobot_nova5_dh`` LeRobot driver and ``Xense/loreal_returns_sorting_0831``.
+    """
+
+    use_delta_cartesian_actions: bool = True
+    default_prompt: str | None = None
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[dobot_nova5_policy.DobotNova5Inputs()],
+            outputs=[dobot_nova5_policy.DobotNova5Outputs()],
+        )
+
+        if self.use_delta_cartesian_actions:
+            # Delta-encode the 9D TCP target; keep the gripper command absolute.
+            delta_action_mask = _transforms.make_bool_mask(9, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "head": "observation.images.head",
+                                "wrist": "observation.images.wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "task",
+                        }
+                    )
+                ]
+            ),
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -943,6 +995,31 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=60_000,
         num_workers=64,
+        fsdp_devices=8,
+    ),
+    TrainConfig(
+        name="pi05_base_dobot_nova5_loreal_returns_sorting_0831",
+        model=pi0_config.Pi0Config(
+            max_token_len=200,
+            pi05=True,
+            discrete_state_input=True,
+            enable_training_time_rtc=True,
+        ),
+        data=LeRobotDobotNova5DataConfig(
+            repo_id="Xense/loreal_returns_sorting_0831",
+            use_delta_cartesian_actions=True,
+            default_prompt="Pick up returned cosmetic from conveyor, place neatly on left platform.",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        ema_decay=None,
+        batch_size=256,
+        num_workers=64,
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
         fsdp_devices=8,
     ),
     TrainConfig(
