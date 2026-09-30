@@ -32,6 +32,15 @@ mamba run -n lerobot-xense-v4 python scripts/serve_policy.py \
     --policy.dir=<checkpoint_step_path>
 ```
 
+
+```bash
+cd /home/zdh/xense-openpi
+mamba run -n lerobot-xense-v4 python scripts/serve_policy.py \
+    policy:checkpoint \
+    --policy.config=pi05_base_dobot_nova5_loreal_returns_sorting_0929 \
+    --policy.dir=<checkpoint_step_path>
+```
+
 ## Dry run
 
 先连接真实机械臂和相机、检查观测与策略输出，但不下发策略动作：
