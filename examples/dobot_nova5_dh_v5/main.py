@@ -65,6 +65,7 @@ from xense_client.runtime import runtime as _runtime
 from xense_client.runtime.agents import policy_agent as _policy_agent
 
 import examples.dobot_nova5_dh_v5.env as _env
+from examples.dobot_nova5_dh_v5.interlocked_policy import InterlockedPolicy
 
 logger = get_logger("DobotNova5DHMain")
 
@@ -189,22 +190,29 @@ def main(args: Args) -> None:
 
     effective_broker_hz = args.action_hz if decoupled_mode else args.runtime_hz
     if args.rtc_enabled:
-        policy = rtc_action_chunk_broker.RTCActionChunkBroker(
-            policy=websocket_policy,
-            frequency_hz=effective_broker_hz,
-            action_queue_size_to_get_new_actions=args.action_queue_size_to_get_new_actions,
-            rtc_enabled=True,
-            execution_horizon=args.execution_horizon,
-            blend_steps=args.blend_steps,
-            default_delay=args.default_delay,
-            dry_run=args.dry_run,
-            delta_state_dim=9,
-        )
+        def policy_factory():
+            return rtc_action_chunk_broker.RTCActionChunkBroker(
+                policy=websocket_policy,
+                frequency_hz=effective_broker_hz,
+                action_queue_size_to_get_new_actions=args.action_queue_size_to_get_new_actions,
+                rtc_enabled=True,
+                execution_horizon=args.execution_horizon,
+                blend_steps=args.blend_steps,
+                default_delay=args.default_delay,
+                dry_run=args.dry_run,
+                delta_state_dim=9,
+            )
     else:
-        policy = action_chunk_broker.ActionChunkBroker(
-            policy=websocket_policy,
-            action_horizon=args.action_horizon,
-        )
+        def policy_factory():
+            return action_chunk_broker.ActionChunkBroker(
+                policy=websocket_policy,
+                action_horizon=args.action_horizon,
+            )
+
+    if args.turntable_interlock:
+        policy = InterlockedPolicy(policy_factory, base_environment)
+    else:
+        policy = policy_factory()
 
     if decoupled_mode:
         policy = _paced_broker.PacedBroker(
@@ -212,6 +220,8 @@ def main(args: Args) -> None:
             queue_size=args.paced_queue_size,
             target_hz=args.action_hz,
         )
+        if args.turntable_interlock:
+            policy._inner.set_on_resume(policy.discard_pending_actions)
 
     if decoupled_mode:
         logger.info(f"Decoupled runtime: observation at {args.runtime_hz} Hz, action at {args.action_hz} Hz")
@@ -238,13 +248,13 @@ def main(args: Args) -> None:
         try:
             environment.disconnect()
         except Exception as exception:
-            logger.warning(f"Error disconnecting Dobot Nova5 DH: {exception}")
+            logger.warn(f"Error disconnecting Dobot Nova5 DH: {exception}")
 
     shutdown_in_progress = threading.Event()
 
     def signal_handler(_signal_number, _frame) -> None:
         if shutdown_in_progress.is_set():
-            logger.warning("Second Ctrl+C: forcing exit; the arm may not return home")
+            logger.warn("Second Ctrl+C: forcing exit; the arm may not return home")
             os._exit(1)
         shutdown_in_progress.set()
         logger.info("Ctrl+C: requesting a graceful runtime stop")

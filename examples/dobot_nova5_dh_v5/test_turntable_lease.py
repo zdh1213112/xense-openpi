@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from examples.dobot_nova5_dh_v5.real_env import DobotNova5DHRealEnv
+from examples.dobot_nova5_dh_v5.interlocked_policy import InterlockedPolicy
 from examples.dobot_nova5_dh_v5.turntable_lease import TurntableLease
 
 
@@ -274,7 +275,9 @@ def test_revoked_policy_action_becomes_y_only_retreat():
 
     sent = environment.robot.send_action.call_args.args[0]
     assert sent["tcp.y"] == pytest.approx(0.39)
-    assert all(sent[key] == value for key, value in current.items() if key != "tcp.y")
+    assert all(sent[key] == value for key, value in current.items()
+               if key not in ("tcp.y", "gripper.pos"))
+    assert sent["gripper.pos"] == 0.0
 
 
 def test_cached_observation_avoids_a_second_camera_read():
@@ -321,10 +324,12 @@ def test_101_pick_guard_retreats_y_only_without_stopping_policy_execution():
 
     sent = environment.robot.send_action.call_args.args[0]
     assert sent["tcp.y"] == pytest.approx(0.38)
-    assert all(sent[key] == value for key, value in current.items() if key != "tcp.y")
+    assert all(sent[key] == value for key, value in current.items()
+               if key not in ("tcp.y", "gripper.pos"))
+    assert sent["gripper.pos"] == 0.0
 
 
-def test_101_pick_guard_clamps_y_before_dangerous_target():
+def test_101_pick_guard_clamps_y_and_keeps_last_closed_gripper_target():
     lease = lease_without_ros()
     lease._guard_max_y_m = 0.325
     current = {"tcp.x": 0.400, "tcp.y": 0.280,
@@ -336,6 +341,7 @@ def test_101_pick_guard_clamps_y_before_dangerous_target():
     environment._latest_tcp_y = 0.280
     environment._latest_raw_obs = current
     environment._last_target_tcp_y = 0.280
+    environment._last_gripper_target = 0.0
     environment.robot = SimpleNamespace(
         get_observation=MagicMock(return_value=current),
         send_action=MagicMock(),
@@ -350,7 +356,119 @@ def test_101_pick_guard_clamps_y_before_dangerous_target():
     assert sent["tcp.y"] == pytest.approx(0.320)
     assert sent["tcp.x"] == pytest.approx(float(policy_action[0]))
     assert sent["tcp.z"] == pytest.approx(float(policy_action[2]))
-    assert sent["gripper.pos"] == pytest.approx(float(policy_action[9]))
+    assert sent["gripper.pos"] == 0.0
+    assert environment.policy_blocked
+
+
+def test_lease_denial_pauses_policy_and_rejects_prefetched_actions():
+    lease = lease_without_ros()
+    lease._client.service_is_ready.return_value = False
+    current = {"tcp.x": 0.488, "tcp.y": 0.364,
+               "tcp.z": 0.244, "gripper.pos": 0.0}
+    current.update({f"tcp.r{i}": 0.0 for i in range(1, 7)})
+    environment = DobotNova5DHRealEnv.__new__(DobotNova5DHRealEnv)
+    environment._guard_action_lock = threading.RLock()
+    environment.turntable_lease = lease
+    environment._latest_tcp_y = current["tcp.y"]
+    environment._latest_raw_obs = current
+    environment._latest_raw_obs_at = time.monotonic()
+    environment._last_target_tcp_x = current["tcp.x"]
+    environment._last_target_tcp_y = current["tcp.y"]
+    environment._last_target_tcp_z = current["tcp.z"]
+    environment._last_lease_wait_log_at = time.monotonic()
+    environment._last_gripper_target = 0.0
+    environment._policy_generation = 0
+    environment._policy_blocked = False
+    environment.robot = SimpleNamespace(send_action=MagicMock())
+
+    blocked = np.asarray([0.493, 0.402, 0.237, *([0.0] * 6), 1.0])
+    environment.send_action(blocked, expected_generation=0)
+    environment.robot.send_action.assert_not_called()
+    assert environment.policy_blocked
+    assert environment.policy_generation == 1
+    assert environment._last_gripper_target == 0.0
+
+    # Actions prefetched before the hold cannot slip through while paused.
+    environment.send_action(
+        np.asarray([0.490, 0.360, 0.240, *([0.0] * 6), 1.0]),
+        expected_generation=0,
+    )
+    environment.robot.send_action.assert_not_called()
+
+    lease._held = True
+    assert environment.poll_policy_resume()
+    assert not environment.policy_blocked
+    assert environment.policy_generation == 2
+    environment.send_action(
+        np.asarray([0.490, 0.360, 0.240, *([0.0] * 6), 1.0]),
+        expected_generation=1,
+    )
+    environment.robot.send_action.assert_not_called()
+
+
+def test_hold_never_reopens_when_queued_and_observed_gripper_disagree():
+    environment = DobotNova5DHRealEnv.__new__(DobotNova5DHRealEnv)
+    environment._last_gripper_target = 1.0
+    assert environment._gripper_hold_target({"gripper.pos": 0.0}) == 0.0
+    environment._last_gripper_target = 0.0
+    assert environment._gripper_hold_target({"gripper.pos": 1.0}) == 0.0
+
+
+def test_first_policy_hold_drains_worker_and_resends_closed_gripper():
+    environment = DobotNova5DHRealEnv.__new__(DobotNova5DHRealEnv)
+    environment._last_gripper_target = 0.0
+    current = {"tcp.x": 0.488, "tcp.y": 0.364, "tcp.z": 0.244,
+               "gripper.pos": 1.0}
+    current.update({f"tcp.r{i}": 0.0 for i in range(1, 7)})
+    environment.robot = SimpleNamespace(
+        _pause_action_worker=lambda: nullcontext(),
+        get_observation=MagicMock(return_value=current),
+        _send_action_sync=MagicMock(),
+    )
+
+    environment._pause_policy_for_action({"tcp.y": 0.402})
+
+    held = environment.robot._send_action_sync.call_args.args[0]
+    assert held["tcp.y"] == pytest.approx(0.364)
+    assert held["gripper.pos"] == 0.0
+    assert environment.policy_blocked
+
+
+def test_interlocked_policy_replans_from_fresh_observation_after_grant():
+    class FakeBroker:
+        def __init__(self):
+            self.infer = MagicMock(return_value={"actions": np.zeros(10)})
+            self.warmup = MagicMock()
+            self.stop = MagicMock()
+            self.reset = MagicMock()
+
+    state = SimpleNamespace(policy_blocked=True, policy_generation=1)
+    state.poll_policy_resume = MagicMock(return_value=False)
+    brokers = []
+
+    def factory():
+        broker = FakeBroker()
+        brokers.append(broker)
+        return broker
+
+    policy = InterlockedPolicy(factory, state)
+    first = {"state": "old"}
+    assert policy.infer(first) == {"_interlock_hold": True}
+    brokers[0].infer.assert_not_called()
+
+    def grant():
+        state.policy_blocked = False
+        state.policy_generation = 2
+        return True
+
+    state.poll_policy_resume.side_effect = grant
+    latest = {"state": "fresh"}
+    result = policy.infer(latest)
+    assert result["_policy_generation"] == 2
+    assert len(brokers) == 2
+    brokers[0].stop.assert_called_once()
+    brokers[1].warmup.assert_called_once_with(latest)
+    brokers[1].infer.assert_called_once_with(latest)
 
 
 def test_guard_holds_before_changing_x_when_previous_servo_target_was_high_y():

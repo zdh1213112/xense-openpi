@@ -131,6 +131,14 @@ class PacedBroker(_base_policy.BasePolicy):
     def queue_size(self) -> int:
         return self._action_queue.qsize()
 
+    def discard_pending_actions(self) -> None:
+        """Drop prefetched actions after an external motion interlock clears."""
+        try:
+            while True:
+                self._action_queue.get_nowait()
+        except queue.Empty:
+            pass
+
     def start(self) -> None:
         """Spawn the producer thread. Idempotent: no-op if already running."""
         if self._producer_thread is not None and self._producer_thread.is_alive():

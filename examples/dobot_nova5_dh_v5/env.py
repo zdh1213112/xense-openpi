@@ -91,6 +91,8 @@ class DobotNova5DHEnvironment(_environment.Environment):
 
     @override
     def apply_action(self, action: dict) -> None:
+        if action.get("_interlock_hold"):
+            return
         actions = action.get("actions")
         if actions is None:
             raise KeyError("Policy result does not contain an 'actions' field")
@@ -99,10 +101,26 @@ class DobotNova5DHEnvironment(_environment.Environment):
         flat_action = np.asarray(actions).reshape(-1)
         parts = " | ".join(f"{label}={value:+.4f}" for label, value in zip(_ACTION_LABELS, flat_action))
         logger.debug(f"Step {self._step_count}: {parts}")
-        self._env.send_action(flat_action)
+        self._env.send_action(
+            flat_action, expected_generation=action.get("_policy_generation")
+        )
+
+    @property
+    def policy_blocked(self) -> bool:
+        return self._env.policy_blocked
+
+    @property
+    def policy_generation(self) -> int:
+        return self._env.policy_generation
+
+    def poll_policy_resume(self) -> bool:
+        return self._env.poll_policy_resume()
 
     def disconnect(self) -> None:
         self._env.disconnect()
 
     def request_stop(self) -> None:
         self._env.request_stop()
+
+    def return_home_after_shutdown(self) -> None:
+        self._env.return_home_after_shutdown()
