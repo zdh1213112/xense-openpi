@@ -90,7 +90,7 @@ class DobotNova5DHEnvironment(_environment.Environment):
         }
 
     @override
-    def apply_action(self, action: dict) -> None:
+    def apply_action(self, action: dict) -> bool | None:
         if action.get("_interlock_hold"):
             return
         actions = action.get("actions")
@@ -101,7 +101,7 @@ class DobotNova5DHEnvironment(_environment.Environment):
         flat_action = np.asarray(actions).reshape(-1)
         parts = " | ".join(f"{label}={value:+.4f}" for label, value in zip(_ACTION_LABELS, flat_action))
         logger.debug(f"Step {self._step_count}: {parts}")
-        self._env.send_action(
+        return self._env.send_action(
             flat_action, expected_generation=action.get("_policy_generation")
         )
 

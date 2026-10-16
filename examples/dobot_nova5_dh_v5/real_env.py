@@ -18,7 +18,7 @@ import dm_env
 from lerobot.robots.dobot_nova5_dh.config_dobot_nova5_dh import ControlMode
 from lerobot.robots.dobot_nova5_dh.config_dobot_nova5_dh import DobotNova5DHConfig
 from lerobot.robots.dobot_nova5_dh.config_dobot_nova5_dh import ResetTarget
-from lerobot.robots.utils import make_robot_from_config
+from examples.dobot_nova5_dh_v5.feedback_robot import FeedbackSafeDobotNova5DH, StaleFeedbackError
 from lerobot.utils.robot_utils import get_logger
 import numpy as np
 
@@ -26,6 +26,8 @@ logger = get_logger("DobotNova5DHRealEnv")
 
 _POLICY_CAMERAS = ("head", "wrist")
 _ACTION_DIM = 10
+_LEASE_REPLY_GRACE_S = 0.15
+_HELD_FEEDBACK_RECOVERY_S = 2.0
 
 
 class DobotNova5DHRealEnv:
@@ -69,7 +71,12 @@ class DobotNova5DHRealEnv:
         self._last_lease_wait_log_at = 0.0
         self._last_gripper_target = None
         self._policy_blocked = False
+        self._policy_hold_established = False
+        self._feedback_recovery_hold = False
         self._blocked_action = None
+        self._blocked_reason = None
+        self._refresh_after_resume = False
+        self._lease_wait_started_at = None
         self._policy_generation = 0
         self.config = DobotNova5DHConfig(
             id="dobot_nova5_dh_inference",
@@ -93,7 +100,7 @@ class DobotNova5DHRealEnv:
             enable_tactile_sensors=enable_tactile_sensors,
             use_gripper=use_gripper,
         )
-        self.robot = make_robot_from_config(self.config)
+        self.robot = FeedbackSafeDobotNova5DH(self.config)
         if self.turntable_lease is not None:
             self.turntable_lease.set_guard_transition_handler(
                 self._install_guard_after_worker_drain
@@ -157,18 +164,79 @@ class DobotNova5DHRealEnv:
 
     def get_observation(self) -> dict[str, Any]:
         """Return an observation in the OpenPI/Xense runtime format."""
-        raw_obs = self.robot.get_observation()
+        raw_obs = self._get_observation_with_held_feedback_recovery()
         self._latest_raw_obs = raw_obs
         self._latest_raw_obs_at = time.monotonic()
         self._latest_tcp_y = float(raw_obs["tcp.y"])
         if self.turntable_lease is not None:
             self.turntable_lease.note_position(
-                self._latest_tcp_y, self._last_target_tcp_y
+                self._latest_tcp_y, self._last_target_tcp_y, actual_x_m=raw_obs.get("tcp.x"),
+            )
+            self.turntable_lease.poll_ready_placement()
+        now = time.monotonic()
+        if (
+            hasattr(self.robot, "feedback_diagnostics")
+            and now - getattr(self, "_last_execution_status_at", 0.0) >= 2.0
+        ):
+            self._last_execution_status_at = now
+            lease = self.turntable_lease
+            logger.info(
+                "102 execution status: "
+                f"policy_blocked={self.policy_blocked}, "
+                f"lease_held={lease.held if lease is not None else False}, "
+                f"guard_active={lease.pick_guard_active if lease is not None else False}, "
+                f"actual XYZ=({raw_obs['tcp.x']:.3f},{raw_obs['tcp.y']:.3f},"
+                f"{raw_obs['tcp.z']:.3f})m; {self.robot.feedback_diagnostics()}"
             )
         obs = collections.OrderedDict()
         obs["qpos"] = self.get_qpos(raw_obs)
         obs["images"] = self.get_images(raw_obs)
         return obs
+
+    def _get_observation_with_held_feedback_recovery(self) -> dict[str, Any]:
+        try:
+            return self.robot.get_observation()
+        except StaleFeedbackError:
+            lease = self.turntable_lease
+            with self._guard_action_lock:
+                if (
+                    lease is None or lease.stopping
+                    or not self.policy_blocked
+                    or not getattr(self, "_policy_hold_established", False)
+                ):
+                    raise
+                # Never let another inference/action thread resume using the
+                # cached pose while this thread waits for real measurements.
+                self._feedback_recovery_hold = True
+                self._latest_raw_obs_at = 0.0
+            started = time.monotonic()
+            logger.warn(
+                "102 feedback delayed during protection hold; keeping actions blocked "
+                f"and waiting up to {_HELD_FEEDBACK_RECOVERY_S:.1f}s for fresh feedback; "
+                f"{self.robot.feedback_diagnostics()}"
+            )
+            with self.robot._pause_action_worker():
+                if not self.robot.wait_for_fresh_feedback(
+                    _HELD_FEEDBACK_RECOVERY_S,
+                    cancel_requested=lambda: lease.stopping,
+                ):
+                    # Leave the recovery hold latched on failure, so even a
+                    # concurrent policy cannot resume during fault cleanup.
+                    raise StaleFeedbackError(
+                        "102 feedback did not recover during protection hold; "
+                        f"motion/gripper commands remain blocked: {self.robot.feedback_diagnostics()}"
+                    )
+                raw_obs = self.robot.get_observation()
+            with self._guard_action_lock:
+                self._latest_raw_obs = raw_obs
+                self._latest_raw_obs_at = time.monotonic()
+                self._latest_tcp_y = float(raw_obs["tcp.y"])
+                self._feedback_recovery_hold = False
+            logger.info(
+                f"102 fresh feedback recovered after {(time.monotonic() - started) * 1000:.0f}ms; "
+                "protection hold remains until guard and lease allow a fresh plan"
+            )
+            return raw_obs
 
     def _gripper_hold_target(self, current: dict[str, Any]) -> float:
         # Measured finger opening is not a safe replacement for a commanded
@@ -189,10 +257,13 @@ class DobotNova5DHRealEnv:
     def policy_blocked(self) -> bool:
         return getattr(self, "_policy_blocked", False)
 
-    def _pause_policy_for_action(self, action: dict[str, float]) -> None:
+    def _pause_policy_for_action(
+        self, action: dict[str, float], *, reason: str = "protection",
+    ) -> None:
         if not getattr(self, "_policy_blocked", False):
             self._policy_generation = getattr(self, "_policy_generation", 0) + 1
             self._policy_blocked = True
+            self._policy_hold_established = False
             # Discard any prefetched servo/gripper command before acknowledging
             # the pause. A queued open must not execute after the arm is held.
             if hasattr(self.robot, "_pause_action_worker"):
@@ -207,6 +278,7 @@ class DobotNova5DHRealEnv:
                         }
                         hold["gripper.pos"] = self._gripper_hold_target(current)
                         self.robot._send_action_sync(hold)
+                        self._policy_hold_established = True
                         self._latest_raw_obs = current
                         self._latest_raw_obs_at = time.monotonic()
                         self._latest_tcp_y = float(current["tcp.y"])
@@ -216,14 +288,18 @@ class DobotNova5DHRealEnv:
                 except Exception as exception:
                     logger.error(f"102 could not drain the pending action worker: {exception}")
             logger.warn(
-                "102 VLA action stream paused by turntable protection; "
+                f"102 VLA replan hold: reason={reason}; "
                 "holding the last gripper command until a fresh plan is ready"
             )
+        self._lease_wait_started_at = None
         self._blocked_action = dict(action)
+        self._blocked_reason = reason
 
     def poll_policy_resume(self) -> bool:
         """Poll the lease without consuming another VLA action."""
         with self._guard_action_lock:
+            if getattr(self, "_feedback_recovery_hold", False):
+                return False
             if not self._policy_blocked:
                 return True
             if self.turntable_lease.pick_guard_active:
@@ -238,6 +314,16 @@ class DobotNova5DHRealEnv:
             target = self._blocked_action
             if target is None:
                 return False
+            if (
+                getattr(self, "_blocked_reason", None) == "pick_guard"
+                and not self.turntable_lease.fetch_x_point_clear(target["tcp.x"])
+            ):
+                # A placement can first hit the 320 mm execution boundary,
+                # before its paused action needs the 400 mm lease. Reserve
+                # the placement now, so the fresh plan cannot immediately
+                # pause again when its first target crosses 400 mm.
+                if not self.turntable_lease.poll_placement_lease():
+                    return False
             allowed = self.turntable_lease.require_for_action(
                 float(current["tcp.y"]), target["tcp.y"],
                 actual_x_m=current.get("tcp.x"),
@@ -251,9 +337,15 @@ class DobotNova5DHRealEnv:
             if not allowed:
                 return False
             self._policy_blocked = False
+            self._policy_hold_established = False
             self._blocked_action = None
+            self._blocked_reason = None
+            self._refresh_after_resume = True
             self._policy_generation += 1
-            logger.info("102 VLA action stream resumed; discarding the old action chunk")
+            logger.info(
+                "102 protection cleared and resume permission ready; "
+                f"lease_held={self.turntable_lease.held}; discarding the old action chunk"
+            )
             return True
 
     @staticmethod
@@ -299,18 +391,20 @@ class DobotNova5DHRealEnv:
             observation=self.get_observation(),
         )
 
-    def send_action(self, action: np.ndarray, *, expected_generation: int | None = None) -> None:
+    def send_action(self, action: np.ndarray, *, expected_generation: int | None = None) -> bool | None:
         """Send a collection-compatible 10D Cartesian action to the robot."""
         guard_lock = getattr(self, "_guard_action_lock", None)
         if guard_lock is None:
             if expected_generation is None or expected_generation == self.policy_generation:
-                self._send_action_guarded(action)
+                return self._send_action_guarded(action)
         else:
             with guard_lock:
                 if expected_generation is None or expected_generation == self.policy_generation:
-                    self._send_action_guarded(action)
+                    return self._send_action_guarded(action)
 
-    def _send_action_guarded(self, action: np.ndarray) -> None:
+    def _send_action_guarded(self, action: np.ndarray) -> bool | None:
+        if getattr(self, "_feedback_recovery_hold", False):
+            return
         action_dict = self._build_action_dict(action)
         requested_action = dict(action_dict)
         if self.turntable_lease is not None:
@@ -329,11 +423,12 @@ class DobotNova5DHRealEnv:
                 time.monotonic() - getattr(self, "_latest_raw_obs_at", 0.0)
                 <= 0.10
             )
-            if not observation_fresh and self.turntable_lease.pick_guard_active:
+            if not observation_fresh or getattr(self, "_refresh_after_resume", False):
                 current = self.robot.get_observation()
                 self._latest_raw_obs = current
                 self._latest_raw_obs_at = time.monotonic()
                 self._latest_tcp_y = current_y = float(current["tcp.y"])
+                self._refresh_after_resume = False
                 observation_fresh = True
 
             if self.turntable_lease.pick_guard_active:
@@ -403,6 +498,11 @@ class DobotNova5DHRealEnv:
                 )
                 self._pick_guard_log_state = "clear"
 
+            arm_keys = ("tcp.x", "tcp.y", "tcp.z", *(f"tcp.r{i}" for i in range(1, 7)))
+            pick_guard_intervened = any(
+                action_dict[key] != requested_action[key] for key in arm_keys
+            )
+
             # Stage X onto the safe side while Y remains outside the pick
             # volume. This permits post-place fetching across Y=400 without
             # confusing that transit with a new deposit.
@@ -457,10 +557,39 @@ class DobotNova5DHRealEnv:
                     <= 0.10
                 ),
             )
+            wait_started = getattr(self, "_lease_wait_started_at", None)
+            denied_at = self.turntable_lease.last_denial_at
+            if (
+                wait_started is not None
+                and denied_at is not None and denied_at >= wait_started
+                and not pick_guard_intervened
+            ):
+                # A background prefetch retry must not hide a denial received
+                # while this action was retained, even if a later grant arrives.
+                self._pause_policy_for_action(requested_action, reason="lease_denied")
+                return
             if not allowed:
                 if current_y <= self.turntable_lease.safe_y_m - 0.010:
-                    self._pause_policy_for_action(requested_action)
                     now = time.monotonic()
+                    if (
+                        not self.turntable_lease.pick_guard_active
+                        and not pick_guard_intervened
+                        and all(action_dict[key] == requested_action[key] for key in arm_keys)
+                        and self.turntable_lease.last_acquire_status == "grant request pending"
+                    ):
+                        started = getattr(self, "_lease_wait_started_at", None)
+                        if started is None:
+                            self._lease_wait_started_at = started = now
+                            logger.info(
+                                "102 waiting briefly for placement lease reply; "
+                                "retaining this action and the VLA queue"
+                            )
+                        if now - started < _LEASE_REPLY_GRACE_S:
+                            # The runtime retries this exact action next tick;
+                            # no further chunk actions or gripper commands are
+                            # consumed, and every retry rechecks current limits.
+                            return False
+                    self._pause_policy_for_action(requested_action, reason="lease")
                     if now - getattr(self, "_last_lease_wait_log_at", 0.0) >= 1.0:
                         self._last_lease_wait_log_at = now
                         logger.warn(
@@ -489,11 +618,23 @@ class DobotNova5DHRealEnv:
                     "101 turntable protection: 102 retreating 10 mm in User -Y "
                     "with current X/Z/attitude held"
                 )
-            arm_keys = ("tcp.x", "tcp.y", "tcp.z", *(f"tcp.r{i}" for i in range(1, 7)))
             intervened = any(action_dict[key] != requested_action[key] for key in arm_keys)
             if intervened or not allowed:
                 action_dict["gripper.pos"] = self._gripper_hold_target(current)
-                self._pause_policy_for_action(requested_action)
+                reason = "pick_guard" if pick_guard_intervened else "fetch_staging"
+                if not allowed:
+                    reason = "lease"
+                self._pause_policy_for_action(requested_action, reason=reason)
+            elif getattr(self, "_lease_wait_started_at", None) is not None:
+                waited_ms = (time.monotonic() - self._lease_wait_started_at) * 1000.0
+                if waited_ms >= _LEASE_REPLY_GRACE_S * 1000.0:
+                    self._pause_policy_for_action(requested_action, reason="lease_wait_timeout")
+                    return
+                self._lease_wait_started_at = None
+                logger.info(
+                    f"102 placement lease ready after {waited_ms:.0f}ms; "
+                    "continuing the retained action without replanning"
+                )
             self._last_target_tcp_y = action_dict["tcp.y"]
             self._last_target_tcp_x = action_dict["tcp.x"]
             self._last_target_tcp_z = action_dict["tcp.z"]

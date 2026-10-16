@@ -207,23 +207,37 @@ class DecoupledRuntime:
         """Pop actions from the broker queue and execute them at action_hz."""
         period = 1.0 / self._action_hz
         next_tick = time.time()
+        pending_action = None
 
         while self._in_episode and not self._stop_event.is_set():
             try:
                 # Bounded wait so we notice shutdown promptly even if the
                 # producer hasn't put anything yet.
-                action = self._broker.pop_action(timeout=0.5)
+                action = pending_action
+                if action is None:
+                    action = self._broker.pop_action(timeout=0.5)
             except Exception:
                 # queue.Empty after timeout — just loop and re-check stop flag.
                 continue
 
             t_send_start = time.time()
             try:
-                self._environment.apply_action(action)
+                consumed = self._environment.apply_action(action) is not False
+                pending_action = None if consumed else action
             except Exception as e:
                 logger.error(f"apply_action failed: {e}")
                 self.mark_episode_complete()
                 break
+
+            if not consumed:
+                # Keep the same action, leave prefetched actions in their
+                # queue, and continue observing without a producer reset.
+                if self._environment.is_episode_complete():
+                    self.mark_episode_complete()
+                    break
+                next_tick = max(next_tick + period, time.time())
+                self._stop_event.wait(max(0.0, next_tick - time.time()))
+                continue
 
             with self._obs_lock:
                 obs_snapshot = self._latest_obs

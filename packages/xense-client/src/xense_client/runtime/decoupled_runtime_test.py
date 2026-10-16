@@ -7,6 +7,7 @@ that action emission decouples from the obs loop.
 
 import threading
 import time
+from unittest.mock import MagicMock
 from typing import Dict, List
 
 import pytest
@@ -20,6 +21,28 @@ from xense_client.runtime.decoupled_runtime import DecoupledRuntime
 # Tolerance margin for rate assertions: threading is noisy, especially on
 # loaded CI hosts. 25 % is a sensible loose bound for short test windows.
 _RATE_TOL = 0.25
+
+
+def test_deferred_action_preserves_the_prefetched_queue_and_action_order():
+    first, second = {"actions": 1}, {"actions": 2}
+    env = MagicMock()
+    env.apply_action.side_effect = [False, None, None]
+    env.is_episode_complete.return_value = False
+    broker = MagicMock()
+    broker.pop_action.side_effect = [first, second]
+    subscriber = MagicMock()
+    runtime = DecoupledRuntime(env, broker, [subscriber], obs_hz=30, action_hz=1000, max_episode_steps=2)
+    runtime._in_episode = True
+    runtime._latest_obs = {"step": 1}
+    runtime._action_loop()
+
+    assert broker.pop_action.call_count == 2
+    broker.reset.assert_not_called()
+    calls = env.apply_action.call_args_list
+    assert calls[0].args[0] is first
+    assert calls[1].args[0] is first
+    assert calls[2].args[0] is second
+    assert subscriber.on_step.call_count == 2
 
 
 class FakeEnv(_environment.Environment):

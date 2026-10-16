@@ -99,6 +99,7 @@ class RTCActionChunkBroker(_base_policy.BasePolicy):
         # Track warmup state: first inference is for JIT, second is for real execution
         self._warmup_done = False
         self._warmup_prev_chunk: Optional[np.ndarray] = None  # Store first inference result for second inference
+        self._resume_prefix: Optional[np.ndarray] = None
 
         self._stop_event = threading.Event()
         self._first_inference_done = threading.Event()  # Signal when actions are ready for execution (after warmup)
@@ -135,7 +136,17 @@ class RTCActionChunkBroker(_base_policy.BasePolicy):
                     prefix_sent: Optional[np.ndarray] = None
 
                     # Determine prev_chunk_left_over and estimated_delay based on warmup state
-                    if not self._warmup_done:
+                    if self._resume_prefix is not None:
+                        # No actions were consumed during the external hold.
+                        # Keep the normal prefix shape for the hot server JIT,
+                        # but freeze nothing and start the new plan at step 0.
+                        prev_chunk_left_over = self._resume_prefix
+                        estimated_delay_steps = 0
+                        logger.info(
+                            "RTC: Resume inference from held state; "
+                            f"inference_delay=0, prev_chunk shape={prev_chunk_left_over.shape}"
+                        )
+                    elif not self._warmup_done:
                         if self._warmup_prev_chunk is None:
                             # ===== WARMUP PHASE 1: First inference (JIT compilation) =====
                             # Send None, use default_delay, result will NOT be executed
@@ -217,6 +228,10 @@ class RTCActionChunkBroker(_base_policy.BasePolicy):
                         inference_delay=estimated_delay_steps,
                         execution_horizon=self._execution_horizon,
                     )
+                    if self._stop_event.is_set():
+                        # An interlock retired this broker while inference was
+                        # running. Never merge or execute its late response.
+                        break
 
                     # Calculate actual latency for next time
                     latency = time.perf_counter() - current_time
@@ -305,6 +320,7 @@ class RTCActionChunkBroker(_base_policy.BasePolicy):
                         estimated_delay=estimated_delay_steps,
                         action_index_before_inference=action_index_before_inference,
                     )
+                    self._resume_prefix = None
                     merge_ms = (time.perf_counter() - merge_start) * 1000
                     logger.info(f"RTC: Merge total time: {merge_ms:.2f}ms")
 
@@ -423,8 +439,33 @@ class RTCActionChunkBroker(_base_policy.BasePolicy):
         # Reset warmup state for next episode
         self._warmup_done = False
         self._warmup_prev_chunk = None
+        self._resume_prefix = None
         with self._latest_obs_lock:
             self._latest_obs = None
+
+    def replan(self, obs: Dict, *, hold_action: np.ndarray) -> None:
+        """Prime a fresh broker with one inference after an external hold.
+
+        The policy server must already have completed episode warmup. The
+        caller supplies the measured held action in execution space; it only
+        keeps the prefix shape fixed, since inference_delay=0 freezes nothing.
+        A fresh broker prevents an older in-flight result from entering this
+        queue. No action is skipped to account for wall-clock inference time.
+        """
+        if self._thread_started:
+            raise RuntimeError("RTC replan requires a fresh broker")
+        held = np.asarray(hold_action, dtype=np.float32)
+        if held.ndim != 1 or held.size == 0 or not np.all(np.isfinite(held)):
+            raise ValueError("RTC replan requires a finite 1-D held action")
+        prefix_length = max(1, self._action_queue_size_to_get_new_actions)
+        self._resume_prefix = np.repeat(held[None, :], prefix_length, axis=0)
+        self._warmup_done = True
+        with self._latest_obs_lock:
+            self._latest_obs = obs
+        self._start_thread_if_needed()
+        if not self._first_inference_done.wait(timeout=120.0):
+            raise RuntimeError("RTC replan timed out waiting for the policy server")
+        logger.info("RTC: Resume plan ready after one inference; starting at action 0")
 
     @override
     def warmup(self, obs: Dict) -> None:

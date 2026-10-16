@@ -37,6 +37,9 @@ class TurntableLease:
         self._post_place_fetch = False
         self._guard_sequence = -1
         self._guard_last_at = 0.0
+        self._placement_ready = False
+        self._placement_ready_at = 0.0
+        self._lease_lock = threading.RLock()
         self._guard_transition_handler = None
         self._guard_ack_publisher = self._node.create_publisher(
             UInt32, "/dual_arm_102_guard_ack", 10
@@ -53,16 +56,20 @@ class TurntableLease:
             self._fetch_phase_callback,
             guard_qos,
         )
-        self._node.create_timer(0.1, self._heartbeat)
+        self._node.create_subscription(
+            Bool, "/dual_arm_102_placement_ready",
+            self._placement_ready_callback, guard_qos,
+        )
         self._executor = SingleThreadedExecutor(context=self._context)
         self._executor.add_node(self._node)
         self._thread = threading.Thread(target=self._executor.spin, daemon=True)
-        self._thread.start()
+        self._heartbeat_stop = threading.Event()
         self._held = False
         self._acquire_future = None
         self._release_future = None
         self._last_async_acquire_request = 0.0
         self._last_acquire_status = "not requested"
+        self._last_denial_at = None
         # A reset may need the lease while it retreats from the shared zone.
         # Do not give that lease back during the policy's initial frozen/safe
         # prefix: 101 treats one grant as consumed and will not grant it again
@@ -72,7 +79,25 @@ class TurntableLease:
         self._release_armed = False
         self._stopping = threading.Event()
         self._safe_since = None
+        self._placement_prefetch_timer = self._node.create_timer(
+            0.02, self.poll_ready_placement,
+        )
+        self._thread.start()
         self._heartbeat()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="102-interlock-heartbeat", daemon=True
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self):
+        # Guard transitions may drain a slow servo worker. Keep the liveness
+        # signal independent of that blocking ROS subscription callback.
+        while not self._heartbeat_stop.wait(0.1):
+            try:
+                self._heartbeat()
+            except Exception as exc:
+                if not self._heartbeat_stop.is_set():
+                    self._node.get_logger().error(f"102 heartbeat publish failed: {exc}")
 
     def _heartbeat(self) -> None:
         message = Bool()
@@ -86,6 +111,10 @@ class TurntableLease:
     @property
     def last_acquire_status(self) -> str:
         return getattr(self, "_last_acquire_status", "unknown")
+
+    @property
+    def last_denial_at(self) -> float | None:
+        return getattr(self, "_last_denial_at", None)
 
     @property
     def post_place_fetch(self) -> bool:
@@ -177,6 +206,27 @@ class TurntableLease:
         # continue to gate every command regardless of this label.
         self._post_place_fetch = next_phase
 
+    def _placement_ready_callback(self, message: Bool) -> None:
+        # Advisory only: neither a cached True nor this callback grants entry.
+        self._placement_ready = bool(message.data)
+        self._placement_ready_at = time.monotonic()
+
+    def poll_ready_placement(self) -> bool:
+        """Claim 101's cleared placement window while 102 is still fetching."""
+        if self.stopping or self.pick_guard_active or not self._guard_fresh():
+            return False
+        available = (
+            getattr(self, "_placement_ready", False)
+            and time.monotonic() - getattr(self, "_placement_ready_at", 0.0) <= 0.5
+        )
+        # Consume an outstanding reply even if 101 has already withdrawn the
+        # ready advertisement because that very request obtained ownership.
+        was_held = self.held
+        granted = self._request_acquire_nonblocking(start_request=available)
+        if granted and not was_held:
+            self._node.get_logger().info("102 placement lease acquired ahead of approach")
+        return granted
+
     def _guard_limit_callback(self, message: Float64MultiArray) -> None:
         if len(message.data) != 5:
             return
@@ -200,19 +250,8 @@ class TurntableLease:
         self._guard_last_at = time.monotonic()
         if sequence != self._guard_sequence:
             def install_guard() -> None:
-                if (
-                    self._guard_sequence < 0
-                    or sequence != (self._guard_sequence + 1) % (1 << 24)
-                ):
-                    # A missed phase or a restarted 101 invalidates any local
-                    # belief that the old server still owns our lease.
-                    self._held = False
-                    self._acquire_future = None
-                    self._release_future = None
-                self._guard_max_y_m = min(guard_y, self.safe_y_m)
-                self._collision_x_lt_m = x_lt
-                self._collision_z_gt_m = z_gt
-                self._guard_sequence = sequence
+                with self._lease_lock:
+                    self._install_guard_values(sequence, guard_y, x_lt, z_gt)
 
             if self._guard_transition_handler is not None:
                 # Drain the old async command before acknowledging the new
@@ -223,6 +262,21 @@ class TurntableLease:
         acknowledgment = UInt32()
         acknowledgment.data = sequence
         self._guard_ack_publisher.publish(acknowledgment)
+
+    def _install_guard_values(self, sequence, guard_y, x_lt, z_gt) -> None:
+        if (
+            self._guard_sequence < 0
+            or sequence != (self._guard_sequence + 1) % (1 << 24)
+        ):
+            # A missed phase or a restarted 101 invalidates any local
+            # belief that the old server still owns our lease.
+            self._held = False
+            self._acquire_future = None
+            self._release_future = None
+        self._guard_max_y_m = min(guard_y, self.safe_y_m)
+        self._collision_x_lt_m = x_lt
+        self._collision_z_gt_m = z_gt
+        self._guard_sequence = sequence
 
     def _call(self, acquire: bool, *, ignore_stopping: bool = False) -> bool:
         if not self._client.wait_for_service(timeout_sec=0.2):
@@ -243,7 +297,11 @@ class TurntableLease:
         except Exception:
             return False
 
-    def _request_acquire_nonblocking(self) -> bool:
+    def _request_acquire_nonblocking(self, *, start_request: bool = True) -> bool:
+        with self._lease_lock:
+            return self._poll_acquire_locked(start_request=start_request)
+
+    def _poll_acquire_locked(self, *, start_request: bool) -> bool:
         """Poll/request the turntable lease without stalling the VLA loop."""
         if self._release_future is not None:
             self._last_acquire_status = "previous lease release pending"
@@ -254,8 +312,7 @@ class TurntableLease:
         future = self._acquire_future
         if future is not None:
             if not future.done():
-                if getattr(self, "_last_acquire_status", "not requested") == "not requested":
-                    self._last_acquire_status = "grant request pending"
+                self._last_acquire_status = "grant request pending"
                 return False
             try:
                 response = future.result()
@@ -270,10 +327,14 @@ class TurntableLease:
                     str(getattr(response, "message", "grant denied"))
                     if response is not None else "empty grant response"
                 )
+                self._last_denial_at = time.monotonic()
             except Exception as exc:
                 self._last_acquire_status = f"grant request error: {exc}"
+                self._last_denial_at = time.monotonic()
             self._acquire_future = None
 
+        if not start_request:
+            return False
         now = time.monotonic()
         if now - self._last_async_acquire_request >= 0.1:
             if self._client.service_is_ready():
@@ -281,9 +342,16 @@ class TurntableLease:
                 request.data = True
                 self._acquire_future = self._client.call_async(request)
                 self._last_async_acquire_request = now
+                self._last_acquire_status = "grant request pending"
             else:
                 self._last_acquire_status = "101 lease service unavailable"
         return False
+
+    def poll_placement_lease(self) -> bool:
+        """Reserve the next placement before replanning past the pick guard."""
+        if self.stopping or self.pick_guard_active:
+            return False
+        return self._request_acquire_nonblocking()
 
     def acquire(self) -> None:
         while not self._stopping.is_set():
@@ -339,11 +407,19 @@ class TurntableLease:
             time.sleep(0.1)
         raise RuntimeError("101 could not verify 102 lease release after home")
 
-    def note_position(self, actual_y_m: float, last_target_y_m: float) -> None:
+    def note_position(
+        self, actual_y_m: float, last_target_y_m: float, *, actual_x_m: float | None = None,
+    ) -> None:
+        with self._lease_lock:
+            self._note_position_locked(actual_y_m, last_target_y_m, actual_x_m=actual_x_m)
+
+    def _note_position_locked(self, actual_y_m, last_target_y_m, *, actual_x_m) -> None:
         if not self._held:
             return
         if actual_y_m >= self.safe_y_m:
-            self._release_armed = True
+            safe_fetch = actual_x_m is not None and self.fetch_x_point_clear(actual_x_m)
+            if not safe_fetch:
+                self._release_armed = True
             self._safe_since = None
             return
         if not self._release_armed:
@@ -401,7 +477,7 @@ class TurntableLease:
                 return False
             return True
         elif self._held:
-            self.note_position(actual_y_m, target_y_m)
+            self.note_position(actual_y_m, target_y_m, actual_x_m=actual_x_m)
         return True
 
     def request_stop(self) -> None:
@@ -409,6 +485,8 @@ class TurntableLease:
 
     def close(self) -> None:
         self.request_stop()
+        self._heartbeat_stop.set()
+        self._heartbeat_thread.join(timeout=1.0)
         self._executor.shutdown(timeout_sec=1.0)
         self._thread.join(timeout=1.0)
         self._node.destroy_node()

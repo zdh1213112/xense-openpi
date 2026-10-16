@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from examples.dobot_nova5_dh_v5.real_env import DobotNova5DHRealEnv
+from examples.dobot_nova5_dh_v5.feedback_robot import StaleFeedbackError
 from examples.dobot_nova5_dh_v5.interlocked_policy import InterlockedPolicy
 from examples.dobot_nova5_dh_v5.turntable_lease import TurntableLease
 
@@ -23,6 +24,10 @@ def lease_without_ros():
     lease._guard_sequence = -1
     lease._guard_last_at = time.monotonic()
     lease._guard_transition_handler = None
+    lease._lease_lock = threading.RLock()
+    lease._placement_ready = False
+    lease._placement_ready_at = 0.0
+    lease._node = MagicMock()
     lease._guard_ack_publisher = MagicMock()
     lease._held = False
     lease._release_armed = False
@@ -165,6 +170,71 @@ def test_denied_lease_reports_101_reason_without_blocking_runtime():
     assert lease.last_acquire_status == "101 shared zone unavailable"
 
 
+def test_placement_advertisement_acquires_before_the_400mm_action():
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    grant = Future()
+    lease._client.call_async.return_value = grant
+    lease._placement_ready_callback(SimpleNamespace(data=True))
+    assert not lease.poll_ready_placement()
+    lease._client.call_async.assert_called_once()
+    assert not lease.held  # the advertisement itself is never an entry grant
+
+    grant.set_result(SimpleNamespace(success=True))
+    # 101 stops advertising once it has granted this request. Still consume
+    # the pending response and retain the lease for the next placement.
+    lease._placement_ready_callback(SimpleNamespace(data=False))
+    assert lease.poll_ready_placement()
+    assert lease.held
+    assert not lease._release_armed
+    assert lease.require_for_action(0.299, 0.406)
+    lease._client.call_async.assert_called_once()
+
+
+@pytest.mark.parametrize("condition", ["closed", "stale_ready", "stale_guard", "pick_guard", "stopping"])
+def test_placement_prefetch_requires_a_live_cleared_window(condition):
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._placement_ready_callback(SimpleNamespace(data=True))
+    if condition == "closed":
+        lease._placement_ready = False
+    elif condition == "stale_ready":
+        lease._placement_ready_at = time.monotonic() - 1.0
+    elif condition == "stale_guard":
+        lease._guard_last_at = time.monotonic() - 1.0
+    elif condition == "pick_guard":
+        lease._guard_max_y_m = 0.325
+    else:
+        lease.request_stop()
+    assert not lease.poll_ready_placement()
+    lease._client.call_async.assert_not_called()
+
+
+def test_early_placement_lease_survives_safe_x_fetch_crossing(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._held = True
+    lease._post_place_fetch = True
+    lease.note_position(0.420, 0.430, actual_x_m=0.600)
+    assert not lease._release_armed
+    lease.note_position(0.390, 0.390, actual_x_m=0.600)
+    clock[0] += 0.31
+    lease.note_position(0.390, 0.390, actual_x_m=0.600)
+    assert lease.held
+    lease._client.call_async.assert_not_called()
+
+    # The subsequent measured deposit on the placement side arms normal
+    # release, preserving the one-grant-per-material handoff.
+    lease.note_position(0.420, 0.430, actual_x_m=0.510)
+    assert lease._release_armed
+    lease.note_position(0.390, 0.390, actual_x_m=0.510)
+    clock[0] += 0.31
+    lease.note_position(0.390, 0.390, actual_x_m=0.510)
+    assert lease._client.call_async.call_args.args[0].data is False
+
+
 def test_stale_101_guard_falls_back_to_325mm_y_only():
     lease = lease_without_ros()
     lease._guard_max_y_m = 0.400
@@ -287,6 +357,7 @@ def test_cached_observation_avoids_a_second_camera_read():
     environment.turntable_lease = lease
     environment._latest_tcp_y = 0.398
     environment._latest_raw_obs = current
+    environment._latest_raw_obs_at = time.monotonic()
     environment._last_target_tcp_y = 0.398
     environment.robot = SimpleNamespace(
         get_observation=MagicMock(),
@@ -439,6 +510,7 @@ def test_interlocked_policy_replans_from_fresh_observation_after_grant():
         def __init__(self):
             self.infer = MagicMock(return_value={"actions": np.zeros(10)})
             self.warmup = MagicMock()
+            self.replan = MagicMock()
             self.stop = MagicMock()
             self.reset = MagicMock()
 
@@ -462,13 +534,499 @@ def test_interlocked_policy_replans_from_fresh_observation_after_grant():
         return True
 
     state.poll_policy_resume.side_effect = grant
-    latest = {"state": "fresh"}
-    result = policy.infer(latest)
+    latest = {"state": np.zeros(10), "frame": "fresh"}
+    state.get_observation = MagicMock(return_value=latest)
+    result = policy.infer({"state": "before permission"})
     assert result["_policy_generation"] == 2
     assert len(brokers) == 2
     brokers[0].stop.assert_called_once()
-    brokers[1].warmup.assert_called_once_with(latest)
+    brokers[1].warmup.assert_not_called()
+    brokers[1].replan.assert_called_once_with(latest, hold_action=latest["state"])
     brokers[1].infer.assert_called_once_with(latest)
+    state.get_observation.assert_called_once()
+
+
+def paused_environment(lease, *, x=0.506, y=0.312, z=0.210):
+    current = {"tcp.x": x, "tcp.y": y, "tcp.z": z, "gripper.pos": 0.0}
+    current.update({f"tcp.r{i}": 0.0 for i in range(1, 7)})
+    environment = DobotNova5DHRealEnv.__new__(DobotNova5DHRealEnv)
+    environment._guard_action_lock = threading.RLock()
+    environment.turntable_lease = lease
+    environment._latest_raw_obs = current
+    environment._latest_raw_obs_at = time.monotonic()
+    environment._latest_tcp_y = y
+    environment._last_target_tcp_x = x
+    environment._last_target_tcp_y = y
+    environment._last_target_tcp_z = z
+    environment._last_gripper_target = 0.0
+    environment._policy_generation = 0
+    environment._policy_blocked = False
+    environment.robot = SimpleNamespace(
+        get_observation=MagicMock(return_value=current),
+        send_action=MagicMock(),
+    )
+    return environment
+
+
+def test_stale_feedback_during_established_hold_waits_without_commands_or_losing_guard():
+    lease = lease_without_ros()
+    lease._guard_max_y_m = 0.325
+    env = paused_environment(lease)
+    env.robot._pause_action_worker = lambda: nullcontext()
+    env.robot._send_action_sync = MagicMock()
+    env.robot.feedback_diagnostics = lambda: "feedback_age_ms=106"
+    env._pause_policy_for_action({"tcp.x": 0.5, "tcp.y": 0.42, "tcp.z": 0.2}, reason="pick_guard")
+    assert env._policy_hold_established
+    held_generation = env.policy_generation
+    current = dict(env._latest_raw_obs)
+    current["tcp.y"] = 0.310
+    env.robot.get_observation.side_effect = [StaleFeedbackError("106ms"), current]
+    holds_before = env.robot._send_action_sync.call_count
+
+    def recover(timeout, *, cancel_requested):
+        assert timeout == 2.0
+        assert not cancel_requested()
+        assert not env.poll_policy_resume()
+        # Even if 101 clears its guard during the wait, an old cached pose
+        # cannot authorize motion or opening the gripper.
+        lease._guard_max_y_m = 0.400
+        lease._held = True
+        assert not env.poll_policy_resume()
+        env.send_action(np.asarray([0.5, 0.42, 0.2, *([0.0] * 6), 1.0]),
+                        expected_generation=held_generation)
+        return True
+
+    env.robot.wait_for_fresh_feedback = MagicMock(side_effect=recover)
+    result = env.get_observation()
+    assert result["qpos"][1] == pytest.approx(0.310)
+    assert env.policy_blocked
+    assert env.policy_generation == held_generation
+    assert env._blocked_reason == "pick_guard"
+    assert env._last_gripper_target == 0.0
+    assert not env._feedback_recovery_hold
+    env.robot.send_action.assert_not_called()
+    assert env.robot._send_action_sync.call_count == holds_before
+    assert env.poll_policy_resume()  # fresh pose AND permission are now available
+    assert env.policy_generation == held_generation + 1
+
+
+def test_persistent_feedback_fault_latches_hold_and_never_returns_cached_observation():
+    lease = lease_without_ros()
+    env = paused_environment(lease)
+    env._policy_blocked = True
+    env._policy_hold_established = True
+    env.robot.get_observation.side_effect = StaleFeedbackError("106ms")
+    env.robot.feedback_diagnostics = lambda: "feedback_age_ms=2106"
+    env.robot._pause_action_worker = lambda: nullcontext()
+    env.robot.wait_for_fresh_feedback = MagicMock(return_value=False)
+    with pytest.raises(StaleFeedbackError, match="did not recover during protection hold"):
+        env.get_observation()
+    assert env._feedback_recovery_hold
+    assert env._latest_raw_obs_at == 0.0
+    lease._held = True
+    assert not env.poll_policy_resume()
+    env.send_action(np.zeros(10))
+    env.robot.send_action.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["moving", "hold_not_established", "stopping", "no_interlock"])
+def test_feedback_wait_does_not_hide_faults_outside_established_interlock_hold(state):
+    lease = lease_without_ros()
+    env = paused_environment(lease)
+    env._policy_blocked = state != "moving"
+    env._policy_hold_established = state != "hold_not_established"
+    if state == "stopping":
+        lease.request_stop()
+    if state == "no_interlock":
+        env.turntable_lease = None
+    env.robot.get_observation.side_effect = StaleFeedbackError("106ms")
+    env.robot.wait_for_fresh_feedback = MagicMock()
+    with pytest.raises(StaleFeedbackError, match="106ms"):
+        env.get_observation()
+    env.robot.wait_for_fresh_feedback.assert_not_called()
+
+
+def test_held_feedback_wait_does_not_swallow_other_observation_failures():
+    env = paused_environment(lease_without_ros())
+    env._policy_blocked = True
+    env._policy_hold_established = True
+    env.robot.get_observation.side_effect = RuntimeError("camera failed")
+    with pytest.raises(RuntimeError, match="camera failed"):
+        env.get_observation()
+
+
+def test_normal_pending_lease_retries_same_action_without_a_replan_hold(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    grant = Future()
+    lease._client.call_async.return_value = grant
+    environment = paused_environment(lease, x=0.520, y=0.299, z=0.218)
+    action = np.asarray([0.515, 0.406, 0.233, *([0.0] * 6), 1.0])
+
+    assert environment.send_action(action, expected_generation=0) is False
+    assert not environment.policy_blocked
+    assert environment.policy_generation == 0
+    environment.robot.send_action.assert_not_called()
+
+    clock[0] += 0.032
+    grant.set_result(SimpleNamespace(success=True))
+    assert environment.send_action(action, expected_generation=0) is None
+    assert not environment.policy_blocked
+    assert environment.policy_generation == 0
+    sent = environment.robot.send_action.call_args.args[0]
+    assert sent["tcp.y"] == pytest.approx(0.406)
+    assert sent["gripper.pos"] == 1.0
+    assert environment._lease_wait_started_at is None
+
+
+def test_runtime_retains_rtc_queue_during_a_normal_lease_round_trip():
+    from examples.dobot_nova5_dh_v5.env import DobotNova5DHEnvironment
+    from xense_client.rtc_action_chunk_broker import RTCActionChunkBroker
+    from xense_client.runtime.runtime import Runtime
+    from xense_client.runtime.agents.policy_agent import PolicyAgent
+
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    grant = Future()
+    lease._client.call_async.return_value = grant
+    environment = paused_environment(lease, x=0.520, y=0.299, z=0.218)
+    wrapper = DobotNova5DHEnvironment.__new__(DobotNova5DHEnvironment)
+    wrapper._env = environment
+    wrapper._step_count = 0
+    actions = np.repeat(
+        np.asarray([[0.515, 0.406, 0.233, *([0.0] * 6), 0.0]], dtype=np.float32), 50, axis=0,
+    )
+    actions[:, 1] += np.arange(50, dtype=np.float32) * 0.001
+    server = MagicMock()
+    server.infer.return_value = {"actions": actions}
+    policy = InterlockedPolicy(
+        lambda: RTCActionChunkBroker(server, action_queue_size_to_get_new_actions=30), wrapper,
+    )
+    try:
+        observation = wrapper.get_observation()
+        policy._inner.replan(observation, hold_action=observation["state"])
+        original_broker = policy._inner
+        runtime = Runtime(wrapper, PolicyAgent(policy), [])
+        runtime._step()
+        assert runtime._pending_action is not None
+        assert not environment.policy_blocked
+        environment.robot.send_action.assert_not_called()
+
+        grant.set_result(SimpleNamespace(success=True))
+        runtime._step()
+        runtime._step()
+        assert runtime._pending_action is None
+        assert policy._inner is original_broker
+        assert environment.policy_generation == 0
+        assert not environment.policy_blocked
+        sent = environment.robot.send_action.call_args_list
+        assert len(sent) == 2
+        assert sent[0].args[0]["tcp.y"] == pytest.approx(actions[0, 1])
+        assert sent[1].args[0]["tcp.y"] == pytest.approx(actions[1, 1])
+        server.infer.assert_called_once()
+    finally:
+        policy._inner.stop()
+
+
+@pytest.mark.parametrize("late_grant", [False, True])
+def test_lease_wait_over_150ms_requires_fresh_plan(monkeypatch, late_grant):
+    clock = [100.0]
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    grant = Future()
+    lease._client.call_async.return_value = grant
+    environment = paused_environment(lease, y=0.299)
+    action = np.asarray([0.515, 0.406, 0.233, *([0.0] * 6), 1.0])
+    assert environment.send_action(action) is False
+    clock[0] += 0.16
+    if late_grant:
+        grant.set_result(SimpleNamespace(success=True))
+    assert environment.send_action(action) is None
+    assert environment.policy_blocked
+    assert environment.policy_generation == 1
+    environment.robot.send_action.assert_not_called()
+
+
+def test_explicit_lease_denial_does_not_use_the_short_wait_path():
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    grant = Future()
+    lease._client.call_async.return_value = grant
+    environment = paused_environment(lease, y=0.299)
+    action = np.asarray([0.515, 0.406, 0.233, *([0.0] * 6), 1.0])
+    assert environment.send_action(action) is False
+    grant.set_result(SimpleNamespace(success=False, message="101 shared zone unavailable"))
+    environment.send_action(action)
+    assert environment.policy_blocked
+    assert environment.policy_generation == 1
+    environment.robot.send_action.assert_not_called()
+
+
+def test_background_retry_cannot_hide_a_denial_during_the_short_wait(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._placement_ready_callback(SimpleNamespace(data=True))
+    first, retry = Future(), Future()
+    lease._client.call_async.side_effect = [first, retry]
+    environment = paused_environment(lease, y=0.299)
+    action = np.asarray([0.515, 0.406, 0.233, *([0.0] * 6), 1.0])
+    assert environment.send_action(action) is False
+    first.set_result(SimpleNamespace(success=False, message="101 shared zone unavailable"))
+    clock[0] += 0.11
+    assert not lease.poll_ready_placement()
+    assert lease.last_acquire_status == "grant request pending"
+    retry.set_result(SimpleNamespace(success=True))
+    assert environment.send_action(action) is None
+    assert environment.policy_blocked
+    assert environment._blocked_reason == "lease_denied"
+    environment.robot.send_action.assert_not_called()
+
+
+def test_pending_action_is_rechecked_when_pick_guard_reactivates():
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._post_place_fetch = True
+    lease._client.call_async.return_value = Future()
+    environment = paused_environment(lease, y=0.299)
+    action = np.asarray([0.515, 0.406, 0.233, *([0.0] * 6), 1.0])
+    assert environment.send_action(action) is False
+    lease._guard_max_y_m = 0.325
+    environment.send_action(action)
+    assert environment.policy_blocked
+    assert environment._blocked_reason == "pick_guard"
+    sent = environment.robot.send_action.call_args.args[0]
+    assert sent["tcp.y"] <= 0.320
+    assert sent["gripper.pos"] == 0.0
+
+
+def test_pick_guard_resume_reserves_placement_even_when_old_target_is_below_400():
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._guard_max_y_m = 0.325
+    lease._post_place_fetch = True
+    future = Future()
+    lease._client.call_async.return_value = future
+    environment = paused_environment(lease)
+
+    # Reproduce the log: 323 mm is clipped to the 320 mm command boundary,
+    # but would not by itself require a 400 mm placement lease.
+    environment.send_action(np.asarray([0.506, 0.323, 0.210, *([0.0] * 6), 0.0]))
+    assert environment.policy_blocked
+    assert environment._blocked_reason == "pick_guard"
+    assert environment.policy_generation == 1
+    assert not environment.poll_policy_resume()
+    lease._client.call_async.assert_not_called()
+
+    lease._guard_max_y_m = 0.400
+    assert not environment.poll_policy_resume()
+    assert environment.policy_blocked
+    assert not lease.held
+    assert lease.last_acquire_status == "grant request pending"
+    lease._client.call_async.assert_called_once()
+
+    future.set_result(SimpleNamespace(success=True))
+    assert environment.poll_policy_resume()
+    assert lease.held
+    assert not lease._release_armed
+    assert environment.policy_generation == 2
+    assert environment._refresh_after_resume
+    assert not environment.policy_blocked
+
+    # The newly generated first placement target no longer pauses for a grant.
+    environment.send_action(np.asarray([0.500, 0.498, 0.216, *([0.0] * 6), 0.0]))
+    assert not environment.policy_blocked
+    assert environment.robot.send_action.call_args.args[0]["tcp.y"] == pytest.approx(0.498)
+    assert not lease._release_armed  # predicted entry is not measured entry
+
+
+def test_pick_guard_resume_stays_blocked_after_lease_denial():
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._post_place_fetch = True
+    future = Future()
+    lease._client.call_async.return_value = future
+    environment = paused_environment(lease)
+    environment._pause_policy_for_action(
+        {"tcp.x": 0.506, "tcp.y": 0.323, "tcp.z": 0.210}, reason="pick_guard",
+    )
+    assert not environment.poll_policy_resume()
+    future.set_result(SimpleNamespace(success=False, message="101 shared zone unavailable"))
+    assert not environment.poll_policy_resume()
+    assert environment.policy_blocked
+    assert not lease.held
+    environment.robot.send_action.assert_not_called()
+
+
+def test_safe_x_fetch_resume_does_not_reserve_placement_lease():
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._post_place_fetch = True
+    lease._client.service_is_ready.return_value = False
+    environment = paused_environment(lease, x=0.550, y=0.315)
+    environment._pause_policy_for_action(
+        {"tcp.x": 0.560, "tcp.y": 0.420, "tcp.z": 0.210}, reason="pick_guard",
+    )
+    assert environment.poll_policy_resume()
+    assert not lease.held
+    lease._client.call_async.assert_not_called()
+
+
+def test_resume_refreshes_feedback_and_rechecks_a_reactivated_guard():
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._guard_max_y_m = 0.325
+    environment = paused_environment(lease, x=0.600, y=0.300)
+    environment._refresh_after_resume = True
+    fresh = dict(environment._latest_raw_obs, **{"tcp.x": 0.500, "tcp.y": 0.310})
+    environment.robot.get_observation.return_value = fresh
+
+    environment.send_action(np.asarray([0.600, 0.390, 0.210, *([0.0] * 6), 1.0]))
+
+    environment.robot.get_observation.assert_called_once()
+    assert environment._latest_raw_obs is fresh
+    assert environment.robot.send_action.call_args.args[0]["tcp.y"] <= 0.320
+    assert environment.robot.send_action.call_args.args[0]["gripper.pos"] == 0.0
+    assert environment.policy_blocked
+
+
+def test_expired_feedback_is_refreshed_even_after_guard_release():
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._held = True
+    environment = paused_environment(lease)
+    environment._latest_raw_obs_at = time.monotonic() - 0.5
+    fresh = dict(environment._latest_raw_obs, **{"tcp.y": 0.330})
+    environment.robot.get_observation.return_value = fresh
+
+    environment.send_action(np.asarray([0.500, 0.498, 0.216, *([0.0] * 6), 0.0]))
+
+    environment.robot.get_observation.assert_called_once()
+    assert environment._latest_tcp_y == pytest.approx(0.330)
+    assert not environment.policy_blocked
+
+
+def test_resume_keeps_generation_from_before_inference_if_interlock_changes():
+    state = SimpleNamespace(policy_blocked=True, policy_generation=1)
+    state.get_observation = MagicMock(return_value={"state": np.zeros(10)})
+
+    def grant():
+        state.policy_blocked = False
+        state.policy_generation = 2
+        return True
+
+    state.poll_policy_resume = grant
+
+    def changed_during_replan(*args, **kwargs):
+        state.policy_generation = 3
+        state.policy_blocked = True
+
+    brokers = []
+
+    def factory():
+        broker = SimpleNamespace(
+            stop=MagicMock(), reset=MagicMock(),
+            replan=MagicMock(side_effect=changed_during_replan),
+            infer=MagicMock(return_value={"actions": np.zeros(10)}),
+        )
+        brokers.append(broker)
+        return broker
+
+    policy = InterlockedPolicy(factory, state)
+    result = policy.infer({"state": np.ones(10)})
+    assert result["_policy_generation"] == 2
+    assert state.policy_generation == 3
+    assert state.policy_blocked
+    brokers[0].stop.assert_called_once()
+
+
+def test_reset_after_a_hold_replaces_the_stopped_broker():
+    state = SimpleNamespace(policy_blocked=True, poll_policy_resume=lambda: False)
+    brokers = []
+
+    def factory():
+        broker = SimpleNamespace(stop=MagicMock(), reset=MagicMock())
+        brokers.append(broker)
+        return broker
+
+    policy = InterlockedPolicy(factory, state)
+    assert policy.infer({}) == {"_interlock_hold": True}
+    assert policy.infer({}) == {"_interlock_hold": True}
+    brokers[0].stop.assert_called_once()
+    policy.reset()
+    assert len(brokers) == 2
+    brokers[1].reset.assert_called_once()
+
+
+def test_non_rtc_resume_uses_one_new_inference_without_warmup():
+    from xense_client.action_chunk_broker import ActionChunkBroker
+
+    latest = {"state": np.zeros(10), "frame": "after grant"}
+    state = SimpleNamespace(policy_blocked=True, policy_generation=1)
+    state.get_observation = MagicMock(return_value=latest)
+
+    def grant():
+        state.policy_blocked = False
+        state.policy_generation = 2
+        return True
+
+    state.poll_policy_resume = grant
+    server = MagicMock()
+    server.infer.return_value = {"actions": np.ones((50, 10))}
+    policy = InterlockedPolicy(lambda: ActionChunkBroker(server, action_horizon=20), state)
+    result = policy.infer({"state": np.ones(10), "frame": "before grant"})
+    server.infer.assert_called_once_with(latest)
+    assert result["_policy_generation"] == 2
+    np.testing.assert_array_equal(result["actions"], np.ones(10))
+
+
+def test_rtc_placement_resume_does_not_replan_twice_after_323mm_hold():
+    from examples.dobot_nova5_dh_v5.env import DobotNova5DHEnvironment
+    from xense_client.rtc_action_chunk_broker import RTCActionChunkBroker
+
+    lease = lease_without_ros()
+    lease._guard_sequence = 1
+    lease._guard_max_y_m = 0.325
+    lease._post_place_fetch = True
+    grant = Future()
+    lease._client.call_async.return_value = grant
+    environment = paused_environment(lease)
+    held = np.asarray([0.506, 0.323, 0.210, *([0.0] * 6), 0.0], dtype=np.float32)
+    environment.send_action(held)
+    assert environment.policy_blocked
+
+    wrapper = DobotNova5DHEnvironment.__new__(DobotNova5DHEnvironment)
+    wrapper._env = environment
+    wrapper._step_count = 0
+    actions = np.repeat(held[None, :], 50, axis=0)
+    actions[:, 1] += np.arange(50, dtype=np.float32) * 0.005
+    server = MagicMock()
+    server.infer.return_value = {"actions": actions}
+    policy = InterlockedPolicy(
+        lambda: RTCActionChunkBroker(server, action_queue_size_to_get_new_actions=30), wrapper,
+    )
+    try:
+        lease._guard_max_y_m = 0.400
+        assert policy.infer({}) == {"_interlock_hold": True}
+        server.infer.assert_not_called()
+        grant.set_result(SimpleNamespace(success=True))
+
+        result = policy.infer({"state": np.ones(10)})
+        wrapper.apply_action(result)
+
+        assert lease.held
+        assert not environment.policy_blocked
+        assert environment.policy_generation == 2
+        server.infer.assert_called_once()
+        assert server.infer.call_args.kwargs["inference_delay"] == 0
+        assert environment.robot.send_action.call_args.args[0]["tcp.y"] == pytest.approx(actions[0, 1])
+        assert actions[0, 1] != actions[20, 1]
+    finally:
+        policy._inner.stop()
 
 
 def test_guard_holds_before_changing_x_when_previous_servo_target_was_high_y():
@@ -659,3 +1217,40 @@ def test_guard_ack_transition_replaces_previous_async_target_with_hold():
     sent = environment.robot._send_action_sync.call_args.args[0]
     assert sent["tcp.y"] == pytest.approx(0.28)
     assert sent["tcp.z"] == pytest.approx(0.25)
+
+
+def test_heartbeat_continues_during_blocked_guard_transition_and_policy_stop():
+    lease = lease_without_ros()
+    lease._heartbeat_stop = threading.Event()
+    lease._node = MagicMock()
+    entered = threading.Event()
+    release = threading.Event()
+    beat = threading.Event()
+    lease._heartbeat = beat.set
+
+    def delayed_transition(install):
+        entered.set()
+        assert release.wait(2.0)
+        install()
+
+    lease.set_guard_transition_handler(delayed_transition)
+    guard_thread = threading.Thread(
+        target=lease._guard_limit_callback,
+        args=(SimpleNamespace(data=[1.0, 0.325, 0.535, 0.075, 2.0]),),
+    )
+    heartbeat_thread = threading.Thread(target=lease._heartbeat_loop)
+    try:
+        guard_thread.start()
+        assert entered.wait(2.0)
+        lease.request_stop()
+        heartbeat_thread.start()
+        assert beat.wait(0.5)
+        assert guard_thread.is_alive()
+    finally:
+        release.set()
+        lease._heartbeat_stop.set()
+        guard_thread.join(timeout=2.0)
+        if heartbeat_thread.ident is not None:
+            heartbeat_thread.join(timeout=2.0)
+    assert not guard_thread.is_alive()
+    assert not heartbeat_thread.is_alive()

@@ -6,6 +6,7 @@ request_stop() addition introduced for graceful SIGINT handling.
 
 import threading
 import time
+from unittest.mock import MagicMock
 from typing import Dict, List
 
 from xense_client.runtime import agent as _agent
@@ -41,6 +42,28 @@ class FakeAgent(_agent.Agent):
 
     def reset(self) -> None:
         pass
+
+
+def test_deferred_action_is_retried_before_consuming_another_policy_action():
+    first, second = {"actions": 1}, {"actions": 2}
+    env = FakeEnv(obs_period_s=0)
+    env.apply_action = MagicMock(side_effect=[False, None, None])
+    agent = MagicMock()
+    agent.get_action.side_effect = [first, second]
+    subscriber = MagicMock()
+    runtime = Runtime(env, agent, [subscriber])
+
+    runtime._step()
+    runtime._step()
+    runtime._step()
+
+    assert agent.get_action.call_count == 2
+    calls = env.apply_action.call_args_list
+    assert calls[0].args[0] is first
+    assert calls[1].args[0] is first
+    assert calls[2].args[0] is second
+    assert subscriber.on_step.call_count == 2
+    assert runtime._pending_action is None
 
 
 # ---------------------------------------------------------------------------

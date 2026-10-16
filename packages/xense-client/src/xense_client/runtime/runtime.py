@@ -33,6 +33,7 @@ class Runtime:
         # Set by request_stop() so a SIGINT during episode N doesn't kick off
         # episode N+1. Checked between episodes in run().
         self._stop_requested = False
+        self._pending_action = None
 
     def run(self) -> None:
         """Runs the runtime loop continuously until stop() is called or the environment is done."""
@@ -71,6 +72,7 @@ class Runtime:
         logger.info("Starting episode...")
         self._environment.reset()
         self._agent.reset()
+        self._pending_action = None
         for subscriber in self._subscribers:
             subscriber.on_episode_start()
 
@@ -115,14 +117,18 @@ class Runtime:
         observation = self._environment.get_observation()
         t1 = time.time()
 
-        action = self._agent.get_action(observation)
+        action = self._pending_action
+        if action is None:
+            action = self._agent.get_action(observation)
         t2 = time.time()
 
-        self._environment.apply_action(action)
+        consumed = self._environment.apply_action(action) is not False
+        self._pending_action = None if consumed else action
         t3 = time.time()
 
-        for subscriber in self._subscribers:
-            subscriber.on_step(observation, action)
+        if consumed:
+            for subscriber in self._subscribers:
+                subscriber.on_step(observation, action)
         t4 = time.time()
 
         if self._environment.is_episode_complete() or (

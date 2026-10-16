@@ -1,4 +1,5 @@
 import abc
+from typing import Optional
 
 
 class Environment(abc.ABC):
@@ -28,5 +29,9 @@ class Environment(abc.ABC):
         """Query the environment for the current state."""
 
     @abc.abstractmethod
-    def apply_action(self, action: dict) -> None:
-        """Take an action in the environment."""
+    def apply_action(self, action: dict) -> Optional[bool]:
+        """Apply an action; explicit False defers it for retry on the next tick.
+
+        None (the existing convention) or True consumes the action. False
+        means no part of the action was sent, including gripper commands.
+        """
