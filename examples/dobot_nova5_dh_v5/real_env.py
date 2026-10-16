@@ -50,6 +50,7 @@ class DobotNova5DHRealEnv:
         use_gripper: bool = True,
         turntable_interlock: bool = False,
         turntable_safe_y_m: float = 0.400,
+        turntable_guard_y_margin_m: float = 0.010,
         setup_robot: bool = True,
     ) -> None:
         self._guard_action_lock = threading.RLock()
@@ -58,7 +59,10 @@ class DobotNova5DHRealEnv:
         if turntable_interlock:
             from examples.dobot_nova5_dh_v5.turntable_lease import TurntableLease
 
-            self.turntable_lease = TurntableLease(safe_y_m=turntable_safe_y_m)
+            self.turntable_lease = TurntableLease(
+                safe_y_m=turntable_safe_y_m,
+                guard_y_margin_m=turntable_guard_y_margin_m,
+            )
         else:
             self.turntable_lease = None
         self._pick_guard_log_state = "clear"
@@ -318,7 +322,7 @@ class DobotNova5DHRealEnv:
                 getattr(self, "_blocked_reason", None) == "pick_guard"
                 and not self.turntable_lease.fetch_x_point_clear(target["tcp.x"])
             ):
-                # A placement can first hit the 320 mm execution boundary,
+                # A placement can first hit the 290 mm execution boundary,
                 # before its paused action needs the 400 mm lease. Reserve
                 # the placement now, so the fresh plan cannot immediately
                 # pause again when its first target crosses 400 mm.
@@ -433,7 +437,7 @@ class DobotNova5DHRealEnv:
 
             if self.turntable_lease.pick_guard_active:
                 guard_y = self.turntable_lease.guard_max_y_m
-                guard_target_y = guard_y - 0.005
+                guard_target_y = self.turntable_lease.guard_command_y_m
                 current_xyz = tuple(float(current.get(f"tcp.{axis}", float("nan")))
                                     for axis in "xyz")
                 target_xyz = tuple(float(action_dict[f"tcp.{axis}"]) for axis in "xyz")
@@ -524,7 +528,11 @@ class DobotNova5DHRealEnv:
                         if self.turntable_lease.pick_guard_active
                         else self.turntable_lease.safe_y_m
                     )
-                    guard_target_y = stage_y - 0.005
+                    guard_target_y = (
+                        self.turntable_lease.guard_command_y_m
+                        if self.turntable_lease.pick_guard_active
+                        else stage_y - 0.005
+                    )
                     if current_y > stage_y:
                         action_dict = {
                             key: float(current[key])

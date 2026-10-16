@@ -34,6 +34,7 @@ class DobotNova5DHEnvironment(_environment.Environment):
         use_gripper: bool = True,
         turntable_interlock: bool = False,
         turntable_safe_y_m: float = 0.400,
+        turntable_guard_y_margin_m: float = 0.010,
         render_height: int = 224,
         render_width: int = 224,
         setup_robot: bool = True,
@@ -54,6 +55,7 @@ class DobotNova5DHEnvironment(_environment.Environment):
             use_gripper=use_gripper,
             turntable_interlock=turntable_interlock,
             turntable_safe_y_m=turntable_safe_y_m,
+            turntable_guard_y_margin_m=turntable_guard_y_margin_m,
             setup_robot=setup_robot,
         )
         self._render_height = render_height

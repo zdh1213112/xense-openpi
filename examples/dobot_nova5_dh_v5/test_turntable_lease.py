@@ -17,6 +17,7 @@ from examples.dobot_nova5_dh_v5.turntable_lease import TurntableLease
 def lease_without_ros():
     lease = TurntableLease.__new__(TurntableLease)
     lease.safe_y_m = 0.400
+    lease.guard_y_margin_m = 0.010
     lease._guard_max_y_m = 0.400
     lease._collision_x_lt_m = 0.535
     lease._collision_z_gt_m = 0.075
@@ -41,6 +42,25 @@ def lease_without_ros():
     lease._heartbeat = MagicMock()
     lease._call = MagicMock(return_value=True)
     return lease
+
+
+@pytest.mark.parametrize("margin", [0.0, -0.01, float("nan"), float("inf"), 0.300])
+def test_invalid_y_margin_is_rejected_before_ros_initialization(margin):
+    with pytest.raises(ValueError, match="guard_y_margin_m"):
+        TurntableLease(guard_y_margin_m=margin)
+
+
+def test_environment_forwards_configured_y_margin(monkeypatch):
+    import examples.dobot_nova5_dh_v5.env as env_module
+    factory = MagicMock()
+    monkeypatch.setattr(env_module._real_env, "DobotNova5DHRealEnv", factory)
+
+    env_module.DobotNova5DHEnvironment(
+        turntable_interlock=True, turntable_guard_y_margin_m=0.015, setup_robot=False,
+    )
+
+    assert factory.call_args.kwargs["turntable_guard_y_margin_m"] == 0.015
+    assert factory.call_args.kwargs["setup_robot"] is False
 
 
 def test_shutdown_home_can_acquire_after_policy_stop_and_release_from_safe_pose():
@@ -235,13 +255,15 @@ def test_early_placement_lease_survives_safe_x_fetch_crossing(monkeypatch):
     assert lease._client.call_async.call_args.args[0].data is False
 
 
-def test_stale_101_guard_falls_back_to_325mm_y_only():
+def test_stale_101_guard_falls_back_to_300mm_y_only():
     lease = lease_without_ros()
     lease._guard_max_y_m = 0.400
     lease._guard_last_at = time.monotonic() - 1.0
 
-    assert lease.guard_max_y_m == pytest.approx(0.325)
+    assert lease.guard_max_y_m == pytest.approx(0.300)
     assert lease.pick_guard_active
+    assert lease.collision_segment_clear((0.600, 0.280, 0.100), (0.600, 0.289, 0.100))
+    assert not lease.collision_segment_clear((0.600, 0.280, 0.100), (0.600, 0.294, 0.100))
     assert not lease.collision_segment_clear((0.600, 0.300, 0.100), (0.600, 0.340, 0.100))
 
 
@@ -325,6 +347,60 @@ def test_initial_safe_prefix_does_not_release_reset_lease(monkeypatch):
     lease._call.assert_not_called()
 
 
+@pytest.mark.parametrize("guard_y", [0.300, 0.325])
+@pytest.mark.parametrize("margin", [0.005, 0.010])
+def test_unused_prefetch_yields_to_fresh_pick_guard_after_verified_retreat(monkeypatch, guard_y, margin):
+    now = [100.0]
+    monkeypatch.setattr("time.monotonic", lambda: now[0])
+    lease = lease_without_ros()
+    lease._guard_sequence = 2
+    lease._guard_max_y_m = guard_y
+    lease.guard_y_margin_m = margin
+    lease._held = True
+    future = Future()
+    lease._client.call_async.return_value = future
+
+    lease.note_position(guard_y - margin - 0.001, guard_y - margin - 0.001, actual_x_m=0.500)
+    assert lease.held
+    assert not lease._release_armed
+    lease._client.call_async.assert_not_called()
+    now[0] += 0.31
+    lease.note_position(guard_y - margin - 0.001, guard_y - margin - 0.001, actual_x_m=0.500)
+    lease._client.call_async.assert_called_once()
+    assert lease._client.call_async.call_args.args[0].data is False
+    assert lease.held  # 101 must still independently approve the release.
+    future.set_result(SimpleNamespace(success=True))
+    lease.note_position(guard_y - margin - 0.001, guard_y - margin - 0.001, actual_x_m=0.500)
+    assert not lease.held
+
+
+@pytest.mark.parametrize("reason", ["stale_guard", "actual_inside", "queued_inside", "nonfinite"])
+@pytest.mark.parametrize("guard_y", [0.300, 0.325])
+@pytest.mark.parametrize("margin", [0.005, 0.010])
+def test_unused_prefetch_stays_held_until_pick_yield_is_verified(monkeypatch, reason, guard_y, margin):
+    now = [100.0]
+    monkeypatch.setattr("time.monotonic", lambda: now[0])
+    lease = lease_without_ros()
+    lease._guard_sequence = 2
+    lease._guard_max_y_m = guard_y
+    lease.guard_y_margin_m = margin
+    lease._held = True
+    actual_y, target_y = guard_y - margin - 0.001, guard_y - margin - 0.001
+    if reason == "stale_guard":
+        lease._guard_last_at = 0.0
+    elif reason == "actual_inside":
+        actual_y = guard_y - margin + 0.001
+    elif reason == "queued_inside":
+        target_y = 0.420
+    elif reason == "nonfinite":
+        target_y = float("nan")
+    lease.note_position(actual_y, target_y)
+    now[0] += 0.31
+    lease.note_position(actual_y, target_y)
+    assert lease.held
+    lease._client.call_async.assert_not_called()
+
+
 def test_revoked_policy_action_becomes_y_only_retreat():
     lease = lease_without_ros()
     lease._client.service_is_ready.return_value = False
@@ -400,9 +476,14 @@ def test_101_pick_guard_retreats_y_only_without_stopping_policy_execution():
     assert sent["gripper.pos"] == 0.0
 
 
-def test_101_pick_guard_clamps_y_and_keeps_last_closed_gripper_target():
+@pytest.mark.parametrize(("guard_y", "margin", "expected_y"), [
+    (0.300, 0.010, 0.290), (0.325, 0.010, 0.315),
+    (0.300, 0.005, 0.295), (0.325, 0.005, 0.320),
+])
+def test_101_pick_guard_clamps_y_and_keeps_last_closed_gripper_target(guard_y, margin, expected_y):
     lease = lease_without_ros()
-    lease._guard_max_y_m = 0.325
+    lease._guard_max_y_m = guard_y
+    lease.guard_y_margin_m = margin
     current = {"tcp.x": 0.400, "tcp.y": 0.280,
                "tcp.z": 0.100, "gripper.pos": 0.5}
     current.update({f"tcp.r{i}": float(i) for i in range(1, 7)})
@@ -424,7 +505,7 @@ def test_101_pick_guard_clamps_y_and_keeps_last_closed_gripper_target():
     environment.send_action(policy_action)
 
     sent = environment.robot.send_action.call_args.args[0]
-    assert sent["tcp.y"] == pytest.approx(0.320)
+    assert sent["tcp.y"] == pytest.approx(expected_y)
     assert sent["tcp.x"] == pytest.approx(float(policy_action[0]))
     assert sent["tcp.z"] == pytest.approx(float(policy_action[2]))
     assert sent["gripper.pos"] == 0.0
@@ -1119,14 +1200,14 @@ def test_xyz_guard_retreats_before_changing_x_through_danger_volume():
         np.asarray([0.56, 0.39, 0.10, *([0.0] * 6), 1.0], dtype=np.float32)
     )
     sent = environment.robot.send_action.call_args.args[0]
-    assert sent["tcp.y"] == pytest.approx(0.320)
+    assert sent["tcp.y"] == pytest.approx(0.315)
     assert sent["tcp.x"] == pytest.approx(0.50)
 
     environment.send_action(
         np.asarray([0.56, 0.39, 0.10, *([0.0] * 6), 1.0], dtype=np.float32)
     )
     sent = environment.robot.send_action.call_args.args[0]
-    assert sent["tcp.y"] == pytest.approx(0.320)
+    assert sent["tcp.y"] == pytest.approx(0.315)
     assert sent["tcp.x"] == pytest.approx(0.56)
 
     current["tcp.x"] = 0.56

@@ -65,11 +65,14 @@ mamba run -n lerobot-xense-v4 python -m examples.dobot_nova5_dh_v5.main \
 101 在转盘抓取和底面条码翻转期间通过
 `/dual_arm_102_guard_xyz` 发布 Y/X/Z 危险区边界及阶段序号；102 排空异步动作后
 回复 `/dual_arm_102_guard_ack`，101 收到对应确认后才进入抓取区。默认
-102 User 0 / Tool 1 TCP 同时满足 `Y>325 mm、X<535 mm、Z>75 mm` 时
+102 User 0 / Tool 1 TCP 同时满足 `Y>300 mm、X<535 mm、Z>75 mm` 时
 为危险区。102 保守检查从实测和上一目标到新目标的整段 Cartesian 动作，
-命令边界留 5 mm；若可能穿过危险区，先保持 X/Z 并退到 Y<=320 mm，
+Y 命令边界默认提前 10 mm；若可能穿过危险区，先保持 X/Z 并退到 Y<=290 mm，
 再移动 X/Z。101 也持续检查实测 102 TCP，进入危险区时停止自身动作。
 放料仍需原有 400 mm 租约。
+提前量由 102 V5 启动参数 `--args.turntable-guard-y-margin-m 0.010` 配置，
+单位为米；限幅、Y 路径检查和保护期间未使用许可的归还判断共用该值。
+X/Z 的路径检查余量仍为 5 mm。101 的 300 mm 越界停止线保持不变。
 `/dual_arm_102_post_place_fetch` 标识 101 已观测到本次放料后的 Y 撤离，
 便于区分后续抓下一件与再次放料；该标识单独不会解除保护。抓下一件
 经过 Y>400 mm 时，实测、上一个目标和新目标均须在 `X>=545 mm` 的

@@ -126,6 +126,8 @@ class Args:
     use_gripper: bool = True
     turntable_interlock: bool = False
     turntable_safe_y_m: float = 0.400
+    # Advance the guarded Y command limit by 10 mm from the 101 boundary.
+    turntable_guard_y_margin_m: float = 0.010
 
     # Image rendering
     render_height: int = 224
@@ -177,6 +179,7 @@ def main(args: Args) -> None:
         use_gripper=args.use_gripper,
         turntable_interlock=args.turntable_interlock,
         turntable_safe_y_m=args.turntable_safe_y_m,
+        turntable_guard_y_margin_m=args.turntable_guard_y_margin_m,
         render_height=args.render_height,
         render_width=args.render_width,
         setup_robot=True,
