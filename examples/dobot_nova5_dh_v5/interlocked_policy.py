@@ -60,5 +60,10 @@ class InterlockedPolicy(base_policy.BasePolicy):
         self._inner.reset()
         self._stopped_for_hold = False
 
+    def stop(self) -> None:
+        stop = getattr(self._inner, "stop", None)
+        if stop is not None:
+            stop()
+
     def warmup(self, observation: dict) -> None:
         self._inner.warmup(observation)

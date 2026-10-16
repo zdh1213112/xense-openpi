@@ -212,10 +212,9 @@ def main(args: Args) -> None:
                 action_horizon=args.action_horizon,
             )
 
-    if args.turntable_interlock:
-        policy = InterlockedPolicy(policy_factory, base_environment)
-    else:
-        policy = policy_factory()
+    # Feedback faults require a fresh plan even without the optional ROS lease.
+    policy = InterlockedPolicy(policy_factory, base_environment)
+    replanning_policy = policy
 
     if decoupled_mode:
         policy = _paced_broker.PacedBroker(
@@ -223,8 +222,7 @@ def main(args: Args) -> None:
             queue_size=args.paced_queue_size,
             target_hz=args.action_hz,
         )
-        if args.turntable_interlock:
-            policy._inner.set_on_resume(policy.discard_pending_actions)
+        policy._inner.set_on_resume(policy.discard_pending_actions)
 
     if decoupled_mode:
         logger.info(f"Decoupled runtime: observation at {args.runtime_hz} Hz, action at {args.action_hz} Hz")
@@ -248,6 +246,15 @@ def main(args: Args) -> None:
         )
 
     def safe_disconnect() -> None:
+        base_environment.request_stop()
+        try:
+            stop = getattr(policy, "stop", None)
+            if stop is not None:
+                stop()
+            if policy is not replanning_policy:
+                replanning_policy.stop()
+        except Exception as exception:
+            logger.warn(f"Error stopping policy inference: {exception}")
         try:
             environment.disconnect()
         except Exception as exception:

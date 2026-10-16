@@ -54,6 +54,9 @@ class DobotNova5DHRealEnv:
         setup_robot: bool = True,
     ) -> None:
         self._guard_action_lock = threading.RLock()
+        self._feedback_recovery_lock = threading.Lock()
+        self._stop_requested = threading.Event()
+        self._closing = False
         # The V5 interlock is opt-in. Without it, keep the original VLA
         # runtime independent of ROS and its shared libraries.
         if turntable_interlock:
@@ -107,7 +110,11 @@ class DobotNova5DHRealEnv:
         self.robot = FeedbackSafeDobotNova5DH(self.config)
         if self.turntable_lease is not None:
             self.turntable_lease.set_guard_transition_handler(
-                self._install_guard_after_worker_drain
+                self._install_guard_after_worker_drain,
+                ready_check=lambda: not (
+                    self._closing or self._feedback_recovery_hold
+                    or self.robot.feedback_recovery_pending
+                ),
             )
 
         if setup_robot:
@@ -123,11 +130,15 @@ class DobotNova5DHRealEnv:
             logger.error(f"Failed to connect Dobot Nova5 DH: {exception}")
             raise
 
-    def _install_guard_after_worker_drain(self, install_guard) -> None:
+    def _install_guard_after_worker_drain(self, install_guard) -> bool:
         with self._guard_action_lock:
-            with self.robot._pause_action_worker():
-                install_guard()
-                if self.turntable_lease.pick_guard_active and self.robot.is_connected:
+            if getattr(self, "_closing", False) or getattr(self.robot, "feedback_recovery_pending", False):
+                return False
+            try:
+                with self.robot._pause_action_worker(timeout_s=0.5):
+                    install_guard()
+                    if not (self.turntable_lease.pick_guard_active and self.robot.is_connected):
+                        return True
                     # A Servo command already sent by the worker can keep
                     # moving after its queue is drained. Replace that target
                     # with the measured current pose before acknowledging 101.
@@ -147,6 +158,10 @@ class DobotNova5DHRealEnv:
                     self._last_target_tcp_x = float(current["tcp.x"])
                     self._last_target_tcp_y = float(current["tcp.y"])
                     self._last_target_tcp_z = float(current["tcp.z"])
+                return True
+            except (StaleFeedbackError, TimeoutError) as exc:
+                self._begin_feedback_hold(exc)
+                return False
 
     @staticmethod
     def get_qpos(obs: dict[str, Any]) -> np.ndarray:
@@ -168,7 +183,7 @@ class DobotNova5DHRealEnv:
 
     def get_observation(self) -> dict[str, Any]:
         """Return an observation in the OpenPI/Xense runtime format."""
-        raw_obs = self._get_observation_with_held_feedback_recovery()
+        raw_obs = self._get_observation_with_feedback_recovery()
         self._latest_raw_obs = raw_obs
         self._latest_raw_obs_at = time.monotonic()
         self._latest_tcp_y = float(raw_obs["tcp.y"])
@@ -197,50 +212,112 @@ class DobotNova5DHRealEnv:
         obs["images"] = self.get_images(raw_obs)
         return obs
 
-    def _get_observation_with_held_feedback_recovery(self) -> dict[str, Any]:
-        try:
-            return self.robot.get_observation()
-        except StaleFeedbackError:
-            lease = self.turntable_lease
-            with self._guard_action_lock:
-                if (
-                    lease is None or lease.stopping
-                    or not self.policy_blocked
-                    or not getattr(self, "_policy_hold_established", False)
-                ):
-                    raise
-                # Never let another inference/action thread resume using the
-                # cached pose while this thread waits for real measurements.
-                self._feedback_recovery_hold = True
-                self._latest_raw_obs_at = 0.0
+    def _feedback_cancel_requested(self) -> bool:
+        return (
+            getattr(self, "_closing", False)
+            or self._stop_requested.is_set()
+            or (self.turntable_lease is not None and self.turntable_lease.stopping)
+        )
+
+    def _begin_feedback_hold(self, error) -> None:
+        with self._guard_action_lock:
+            self.robot.latch_feedback_fault()
+            if not getattr(self, "_feedback_recovery_hold", False):
+                self._policy_generation += 1
+                logger.warn(f"102 feedback fault: suspending actions for verified recovery: {error}")
+            self._policy_blocked = True
+            self._feedback_recovery_hold = True
+            self._policy_hold_established = False
+            self._latest_raw_obs_at = 0.0
+            self._lease_wait_started_at = None
+            # Do not retry the action which encountered the fault, including
+            # an opening command. Resume will use the measured stopped pose.
+            self._blocked_action = None
+            self._blocked_reason = "feedback"
+            if self.turntable_lease is not None:
+                self.turntable_lease.invalidate_position_evidence()
+
+    def _get_observation_with_feedback_recovery(self) -> dict[str, Any]:
+        if not (
+            getattr(self.robot, "feedback_recovery_pending", False)
+            or getattr(self, "_feedback_recovery_hold", False)
+        ):
+            try:
+                return self.robot.get_observation()
+            except StaleFeedbackError as exc:
+                self._begin_feedback_hold(exc)
+        else:
+            self._begin_feedback_hold("feedback recovery pending")
+        # The wait is outside the ROS/guard lock. Heartbeats and guard updates
+        # keep running; no ACK is sent while the robot fault latch is set.
+        with self._feedback_recovery_lock:
+            if not self.robot.feedback_recovery_pending and not self._feedback_recovery_hold:
+                return self.robot.get_observation()
             started = time.monotonic()
-            logger.warn(
-                "102 feedback delayed during protection hold; keeping actions blocked "
-                f"and waiting up to {_HELD_FEEDBACK_RECOVERY_S:.1f}s for fresh feedback; "
-                f"{self.robot.feedback_diagnostics()}"
-            )
-            with self.robot._pause_action_worker():
-                if not self.robot.wait_for_fresh_feedback(
-                    _HELD_FEEDBACK_RECOVERY_S,
-                    cancel_requested=lambda: lease.stopping,
-                ):
-                    # Leave the recovery hold latched on failure, so even a
-                    # concurrent policy cannot resume during fault cleanup.
-                    raise StaleFeedbackError(
-                        "102 feedback did not recover during protection hold; "
-                        f"motion/gripper commands remain blocked: {self.robot.feedback_diagnostics()}"
+            stop_sequence = None
+            stop_error = None
+            while not self._feedback_cancel_requested():
+                if stop_sequence is None and stop_error is None:
+                    try:
+                        with self._guard_action_lock:
+                            with self.robot._pause_action_worker(timeout_s=0.5):
+                                try:
+                                    stop_sequence = self.robot.stop_for_feedback_recovery()
+                                except Exception as exc:
+                                    stop_error = str(exc)
+                                    logger.error(
+                                        f"102 feedback recovery Stop unconfirmed: {exc}; "
+                                        "automatic resume disabled; restart after checking the controller"
+                                    )
+                    except TimeoutError as exc:
+                        # A busy worker must finish before this socket can be
+                        # used for Stop. The robot's fault latch blocks its
+                        # next action even if feedback has meanwhile returned.
+                        logger.warn(f"102 feedback recovery is waiting for the action worker: {exc}")
+                if stop_sequence is not None:
+                    ready = self.robot.wait_for_stopped_feedback(
+                        _HELD_FEEDBACK_RECOVERY_S,
+                        after_sequence=stop_sequence,
+                        cancel_requested=self._feedback_cancel_requested,
                     )
-                raw_obs = self.robot.get_observation()
-            with self._guard_action_lock:
-                self._latest_raw_obs = raw_obs
-                self._latest_raw_obs_at = time.monotonic()
-                self._latest_tcp_y = float(raw_obs["tcp.y"])
-                self._feedback_recovery_hold = False
-            logger.info(
-                f"102 fresh feedback recovered after {(time.monotonic() - started) * 1000:.0f}ms; "
-                "protection hold remains until guard and lease allow a fresh plan"
-            )
-            return raw_obs
+                    if ready:
+                        with self._guard_action_lock:
+                            if self._feedback_cancel_requested():
+                                break
+                            try:
+                                raw_obs = self.robot.get_observation()
+                                self.robot.finish_feedback_recovery(stop_sequence)
+                            except StaleFeedbackError:
+                                continue
+                            self._latest_raw_obs = raw_obs
+                            self._latest_raw_obs_at = time.monotonic()
+                            self._latest_tcp_y = float(raw_obs["tcp.y"])
+                            for axis in "xyz":
+                                setattr(self, f"_last_target_tcp_{axis}", float(raw_obs[f"tcp.{axis}"]))
+                            self._blocked_action = {
+                                key: float(raw_obs[key]) for key in (
+                                    "tcp.x", "tcp.y", "tcp.z",
+                                    *(f"tcp.r{i}" for i in range(1, 7)),
+                                )
+                            }
+                            self._blocked_action["gripper.pos"] = self._gripper_hold_target(raw_obs)
+                            self._policy_hold_established = True
+                            self._feedback_recovery_hold = False
+                        logger.info(
+                            f"102 feedback recovered after {(time.monotonic() - started) * 1000:.0f}ms; "
+                            "Stop and three fresh idle frames verified; waiting for interlock and a fresh plan"
+                        )
+                        return raw_obs
+                else:
+                    self._stop_requested.wait(_HELD_FEEDBACK_RECOVERY_S)
+                if not self._feedback_cancel_requested():
+                    logger.warn(
+                        "102 feedback fault remains paused; no motion/gripper action sent; "
+                        f"{self.robot.feedback_diagnostics()}"
+                    )
+            # Exit a blocked observation promptly on Ctrl+C without returning
+            # cached state to the runtime or generating an error traceback.
+            raise KeyboardInterrupt("102 feedback recovery cancelled")
 
     def _gripper_hold_target(self, current: dict[str, Any]) -> float:
         # Measured finger opening is not a safe replacement for a commanded
@@ -259,7 +336,10 @@ class DobotNova5DHRealEnv:
 
     @property
     def policy_blocked(self) -> bool:
-        return getattr(self, "_policy_blocked", False)
+        return (
+            getattr(self, "_policy_blocked", False)
+            or getattr(self.robot, "feedback_recovery_pending", False)
+        )
 
     def _pause_policy_for_action(
         self, action: dict[str, float], *, reason: str = "protection",
@@ -301,12 +381,23 @@ class DobotNova5DHRealEnv:
 
     def poll_policy_resume(self) -> bool:
         """Poll the lease without consuming another VLA action."""
+        try:
+            return self._poll_policy_resume_guarded()
+        except StaleFeedbackError as exc:
+            self._begin_feedback_hold(exc)
+            return False
+
+    def _poll_policy_resume_guarded(self) -> bool:
         with self._guard_action_lock:
-            if getattr(self, "_feedback_recovery_hold", False):
+            if (
+                getattr(self, "_closing", False)
+                or getattr(self, "_feedback_recovery_hold", False)
+                or getattr(self.robot, "feedback_recovery_pending", False)
+            ):
                 return False
             if not self._policy_blocked:
                 return True
-            if self.turntable_lease.pick_guard_active:
+            if self.turntable_lease is not None and self.turntable_lease.pick_guard_active:
                 return False
             current = self._latest_raw_obs
             fresh = time.monotonic() - self._latest_raw_obs_at <= 0.10
@@ -318,7 +409,7 @@ class DobotNova5DHRealEnv:
             target = self._blocked_action
             if target is None:
                 return False
-            if (
+            if self.turntable_lease is not None and (
                 getattr(self, "_blocked_reason", None) == "pick_guard"
                 and not self.turntable_lease.fetch_x_point_clear(target["tcp.x"])
             ):
@@ -328,7 +419,7 @@ class DobotNova5DHRealEnv:
                 # pause again when its first target crosses 400 mm.
                 if not self.turntable_lease.poll_placement_lease():
                     return False
-            allowed = self.turntable_lease.require_for_action(
+            allowed = self.turntable_lease is None or self.turntable_lease.require_for_action(
                 float(current["tcp.y"]), target["tcp.y"],
                 actual_x_m=current.get("tcp.x"),
                 actual_z_m=current.get("tcp.z"),
@@ -348,7 +439,8 @@ class DobotNova5DHRealEnv:
             self._policy_generation += 1
             logger.info(
                 "102 protection cleared and resume permission ready; "
-                f"lease_held={self.turntable_lease.held}; discarding the old action chunk"
+                f"lease_held={self.turntable_lease.held if self.turntable_lease else False}; "
+                "discarding the old action chunk"
             )
             return True
 
@@ -397,6 +489,15 @@ class DobotNova5DHRealEnv:
 
     def send_action(self, action: np.ndarray, *, expected_generation: int | None = None) -> bool | None:
         """Send a collection-compatible 10D Cartesian action to the robot."""
+        try:
+            return self._submit_action(action, expected_generation=expected_generation)
+        except StaleFeedbackError as exc:
+            self._begin_feedback_hold(exc)
+            return None  # discard this action; never retry it after recovery
+
+    def _submit_action(self, action, *, expected_generation=None):
+        if getattr(self, "_closing", False):
+            return
         guard_lock = getattr(self, "_guard_action_lock", None)
         if guard_lock is None:
             if expected_generation is None or expected_generation == self.policy_generation:
@@ -407,6 +508,8 @@ class DobotNova5DHRealEnv:
                     return self._send_action_guarded(action)
 
     def _send_action_guarded(self, action: np.ndarray) -> bool | None:
+        if getattr(self.robot, "feedback_recovery_pending", False):
+            raise StaleFeedbackError("102 worker/command feedback recovery pending")
         if getattr(self, "_feedback_recovery_hold", False):
             return
         action_dict = self._build_action_dict(action)
@@ -678,29 +781,34 @@ class DobotNova5DHRealEnv:
     def disconnect(self) -> None:
         """Disconnect the arm, gripper, and cameras."""
         logger.info("Disconnecting Dobot Nova5 DH...")
+        self._closing = True
+        self._stop_requested.set()
+        lease = self.turntable_lease
+        if lease is not None:
+            lease.request_stop()
         try:
-            if (
-                self.turntable_lease is not None
-                and self.turntable_lease.held
-                and self.robot.is_connected
-            ):
-                try:
-                    actual_y_m = float(self.robot.get_observation()["tcp.y"])
-                    self.turntable_lease.release_after_shutdown(actual_y_m)
-                    logger.info("102 turntable lease released before disconnect")
-                except Exception as exception:
-                    logger.error(f"102 turntable lease could not be released: {exception}")
-            # DobotNova5DH.disconnect() is idempotent. Calling it unconditionally
-            # also cleans up the arm if a camera dropped and is_connected became false.
-            self.robot.disconnect()
+            with self._guard_action_lock:
+                self.robot._stop_action_worker()
+                if lease is not None and lease.held and self.robot.is_connected:
+                    try:
+                        actual_y_m = float(self.robot.get_observation()["tcp.y"])
+                        lease.release_after_shutdown(actual_y_m)
+                        logger.info("102 turntable lease released before disconnect")
+                    except Exception as exception:
+                        logger.error(f"102 turntable lease could not be released: {exception}")
+            # Stop callbacks BEFORE closing gripper/Dashboard sockets. A late
+            # guard transition must not issue a hold into disconnected devices.
+            try:
+                if lease is not None:
+                    lease.close()
+            finally:
+                self.robot.disconnect()
             logger.info("Dobot Nova5 DH disconnected")
         except Exception as exception:
             logger.warn(f"Error during Dobot Nova5 DH disconnect: {exception}")
-        finally:
-            if self.turntable_lease is not None:
-                self.turntable_lease.close()
 
     def request_stop(self) -> None:
+        self._stop_requested.set()
         if self.turntable_lease is not None:
             self.turntable_lease.request_stop()
 

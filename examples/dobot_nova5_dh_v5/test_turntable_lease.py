@@ -116,14 +116,18 @@ def test_shutdown_home_stops_policy_worker_then_waits_for_lease():
 
 def test_disconnect_releases_held_lease_from_measured_safe_home():
     environment = DobotNova5DHRealEnv.__new__(DobotNova5DHRealEnv)
+    environment._guard_action_lock = threading.RLock()
+    environment._stop_requested = threading.Event()
     order = []
     environment.robot = SimpleNamespace(
         is_connected=True,
+        _stop_action_worker=lambda: order.append("worker_stop"),
         get_observation=lambda: {"tcp.y": 0.300},
         disconnect=lambda: order.append("robot_disconnect"),
     )
     environment.turntable_lease = SimpleNamespace(
         held=True,
+        request_stop=lambda: order.append("lease_stop"),
         release_after_shutdown=lambda y: order.append(("lease_release", y)),
         close=lambda: order.append("lease_close"),
     )
@@ -131,7 +135,7 @@ def test_disconnect_releases_held_lease_from_measured_safe_home():
     environment.disconnect()
 
     assert order == [
-        ("lease_release", 0.300), "robot_disconnect", "lease_close",
+        "lease_stop", "worker_stop", ("lease_release", 0.300), "lease_close", "robot_disconnect",
     ]
 
 
@@ -573,7 +577,7 @@ def test_first_policy_hold_drains_worker_and_resends_closed_gripper():
                "gripper.pos": 1.0}
     current.update({f"tcp.r{i}": 0.0 for i in range(1, 7)})
     environment.robot = SimpleNamespace(
-        _pause_action_worker=lambda: nullcontext(),
+        _pause_action_worker=lambda **kwargs: nullcontext(),
         get_observation=MagicMock(return_value=current),
         _send_action_sync=MagicMock(),
     )
@@ -632,6 +636,10 @@ def paused_environment(lease, *, x=0.506, y=0.312, z=0.210):
     current.update({f"tcp.r{i}": 0.0 for i in range(1, 7)})
     environment = DobotNova5DHRealEnv.__new__(DobotNova5DHRealEnv)
     environment._guard_action_lock = threading.RLock()
+    environment._feedback_recovery_lock = threading.Lock()
+    environment._stop_requested = threading.Event()
+    environment._feedback_recovery_hold = False
+    environment._closing = False
     environment.turntable_lease = lease
     environment._latest_raw_obs = current
     environment._latest_raw_obs_at = time.monotonic()
@@ -647,84 +655,6 @@ def paused_environment(lease, *, x=0.506, y=0.312, z=0.210):
         send_action=MagicMock(),
     )
     return environment
-
-
-def test_stale_feedback_during_established_hold_waits_without_commands_or_losing_guard():
-    lease = lease_without_ros()
-    lease._guard_max_y_m = 0.325
-    env = paused_environment(lease)
-    env.robot._pause_action_worker = lambda: nullcontext()
-    env.robot._send_action_sync = MagicMock()
-    env.robot.feedback_diagnostics = lambda: "feedback_age_ms=106"
-    env._pause_policy_for_action({"tcp.x": 0.5, "tcp.y": 0.42, "tcp.z": 0.2}, reason="pick_guard")
-    assert env._policy_hold_established
-    held_generation = env.policy_generation
-    current = dict(env._latest_raw_obs)
-    current["tcp.y"] = 0.310
-    env.robot.get_observation.side_effect = [StaleFeedbackError("106ms"), current]
-    holds_before = env.robot._send_action_sync.call_count
-
-    def recover(timeout, *, cancel_requested):
-        assert timeout == 2.0
-        assert not cancel_requested()
-        assert not env.poll_policy_resume()
-        # Even if 101 clears its guard during the wait, an old cached pose
-        # cannot authorize motion or opening the gripper.
-        lease._guard_max_y_m = 0.400
-        lease._held = True
-        assert not env.poll_policy_resume()
-        env.send_action(np.asarray([0.5, 0.42, 0.2, *([0.0] * 6), 1.0]),
-                        expected_generation=held_generation)
-        return True
-
-    env.robot.wait_for_fresh_feedback = MagicMock(side_effect=recover)
-    result = env.get_observation()
-    assert result["qpos"][1] == pytest.approx(0.310)
-    assert env.policy_blocked
-    assert env.policy_generation == held_generation
-    assert env._blocked_reason == "pick_guard"
-    assert env._last_gripper_target == 0.0
-    assert not env._feedback_recovery_hold
-    env.robot.send_action.assert_not_called()
-    assert env.robot._send_action_sync.call_count == holds_before
-    assert env.poll_policy_resume()  # fresh pose AND permission are now available
-    assert env.policy_generation == held_generation + 1
-
-
-def test_persistent_feedback_fault_latches_hold_and_never_returns_cached_observation():
-    lease = lease_without_ros()
-    env = paused_environment(lease)
-    env._policy_blocked = True
-    env._policy_hold_established = True
-    env.robot.get_observation.side_effect = StaleFeedbackError("106ms")
-    env.robot.feedback_diagnostics = lambda: "feedback_age_ms=2106"
-    env.robot._pause_action_worker = lambda: nullcontext()
-    env.robot.wait_for_fresh_feedback = MagicMock(return_value=False)
-    with pytest.raises(StaleFeedbackError, match="did not recover during protection hold"):
-        env.get_observation()
-    assert env._feedback_recovery_hold
-    assert env._latest_raw_obs_at == 0.0
-    lease._held = True
-    assert not env.poll_policy_resume()
-    env.send_action(np.zeros(10))
-    env.robot.send_action.assert_not_called()
-
-
-@pytest.mark.parametrize("state", ["moving", "hold_not_established", "stopping", "no_interlock"])
-def test_feedback_wait_does_not_hide_faults_outside_established_interlock_hold(state):
-    lease = lease_without_ros()
-    env = paused_environment(lease)
-    env._policy_blocked = state != "moving"
-    env._policy_hold_established = state != "hold_not_established"
-    if state == "stopping":
-        lease.request_stop()
-    if state == "no_interlock":
-        env.turntable_lease = None
-    env.robot.get_observation.side_effect = StaleFeedbackError("106ms")
-    env.robot.wait_for_fresh_feedback = MagicMock()
-    with pytest.raises(StaleFeedbackError, match="106ms"):
-        env.get_observation()
-    env.robot.wait_for_fresh_feedback.assert_not_called()
 
 
 def test_held_feedback_wait_does_not_swallow_other_observation_failures():
@@ -1286,7 +1216,7 @@ def test_guard_ack_transition_replaces_previous_async_target_with_hold():
     environment.turntable_lease = lease
     environment.robot = SimpleNamespace(
         is_connected=True,
-        _pause_action_worker=lambda: nullcontext(),
+        _pause_action_worker=lambda **kwargs: nullcontext(),
         get_observation=MagicMock(return_value=current),
         _send_action_sync=MagicMock(),
     )

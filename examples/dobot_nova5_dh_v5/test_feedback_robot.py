@@ -1,3 +1,4 @@
+from collections import deque
 import threading
 import time
 from types import SimpleNamespace
@@ -39,6 +40,14 @@ def robot_without_hardware():
     robot._async_action_send_count = 0
     robot._async_action_error_count = 0
     robot._v5_pause_depth = 0
+    robot._v5_feedback_fault = threading.Event()
+    robot._v5_feedback_sequence = 0
+    robot._v5_feedback_samples = deque(maxlen=8)
+    robot._v5_rx_at = time.monotonic()
+    robot._v5_rx_count = 0
+    robot._v5_duplicate_frames = 0
+    robot._v5_max_frame_gap_s = 0.0
+    robot._v5_reconnect_count = 0
     robot.config = SimpleNamespace(async_action_worker=True)
     robot.logger = MagicMock()
     return robot
@@ -264,28 +273,36 @@ def test_held_feedback_wait_cancels_before_accepting_even_a_fresh_pose(reason):
 
 
 @pytest.mark.parametrize("go_home", [False, True])
-def test_disconnect_stops_reader_before_socket_cleanup_and_preserves_home(monkeypatch, go_home):
+def test_disconnect_stops_callbacks_and_reader_before_socket_cleanup_without_sdk_retries(go_home):
     robot = robot_without_hardware()
     robot._is_connected = True
     robot.config.go_to_home_on_disconnect = go_home
+    robot.config.use_gripper = True
+    robot.cameras = {}
     robot._stop_action_worker = MagicMock()
     robot._go_to_home = MagicMock(
         side_effect=lambda: pytest.fail("reader stopped before home")
         if robot._v5_feedback_stop.is_set() else None
     )
-    closed = []
-
-    def base_disconnect(self):
-        assert self._v5_feedback_stop.is_set()
-        assert not self.config.go_to_home_on_disconnect
-        closed.append(True)
-
-    monkeypatch.setattr(
-        "examples.dobot_nova5_dh_v5.feedback_robot.DobotNova5DH.disconnect", base_disconnect,
+    robot.stop_for_feedback_recovery = MagicMock(return_value=1)
+    channels = [MagicMock() for _ in range(3)]
+    apis = [SimpleNamespace(socket_dobot=ch) for ch in channels]
+    robot._robot, robot._gripper_robot, robot._feed = apis
+    robot._gripper = MagicMock()
+    robot._gripper.disconnect.side_effect = lambda: (
+        pytest.fail("reader not stopped before gripper cleanup")
+        if not robot._v5_feedback_stop.is_set() else None
     )
+
     robot.disconnect()
-    assert closed == [True]
+
     assert robot._go_to_home.call_count == int(go_home)
+    robot.stop_for_feedback_recovery.assert_called_once()
+    for api, channel in zip(apis, channels):
+        channel.close.assert_called_once()
+        assert api.socket_dobot == 0
+    assert not robot._is_connected
+    assert robot._robot is None
     assert robot.config.go_to_home_on_disconnect is go_home
 
 

@@ -47,6 +47,8 @@ class TurntableLease:
         self._placement_ready_at = 0.0
         self._lease_lock = threading.RLock()
         self._guard_transition_handler = None
+        self._guard_ready_check = None
+        self._guard_ack_pending = False
         self._guard_ack_publisher = self._node.create_publisher(
             UInt32, "/dual_arm_102_guard_ack", 10
         )
@@ -202,8 +204,13 @@ class TurntableLease:
             or max(start[2], end[2]) <= self._collision_z_gt_m - 0.005
         )
 
-    def set_guard_transition_handler(self, handler) -> None:
+    def set_guard_transition_handler(self, handler, *, ready_check=None) -> None:
         self._guard_transition_handler = handler
+        self._guard_ready_check = ready_check
+
+    def invalidate_position_evidence(self) -> None:
+        with self._lease_lock:
+            self._safe_since = None
 
     @property
     def stopping(self) -> bool:
@@ -226,6 +233,9 @@ class TurntableLease:
         """Claim 101's cleared placement window while 102 is still fetching."""
         if self.stopping or self.pick_guard_active or not self._guard_fresh():
             return False
+        ready_check = getattr(self, "_guard_ready_check", None)
+        if ready_check is not None and not ready_check():
+            return False
         available = (
             getattr(self, "_placement_ready", False)
             and time.monotonic() - getattr(self, "_placement_ready_at", 0.0) <= 0.5
@@ -239,6 +249,8 @@ class TurntableLease:
         return granted
 
     def _guard_limit_callback(self, message: Float64MultiArray) -> None:
+        if self.stopping:
+            return
         if len(message.data) != 5:
             return
         sequence_value, guard_y, x_lt, z_gt, mode_value = (
@@ -259,7 +271,14 @@ class TurntableLease:
         ):
             return
         self._guard_last_at = time.monotonic()
-        if sequence != self._guard_sequence:
+        ready_check = getattr(self, "_guard_ready_check", None)
+        if ready_check is not None and not ready_check():
+            with self._lease_lock:
+                self._install_guard_values(sequence, guard_y, x_lt, z_gt)
+            self._guard_ack_pending = True
+            return
+        if sequence != self._guard_sequence or getattr(self, "_guard_ack_pending", False):
+            self._guard_ack_pending = True
             def install_guard() -> None:
                 with self._lease_lock:
                     self._install_guard_values(sequence, guard_y, x_lt, z_gt)
@@ -267,15 +286,17 @@ class TurntableLease:
             if self._guard_transition_handler is not None:
                 # Drain the old async command before acknowledging the new
                 # protection state to 101.
-                self._guard_transition_handler(install_guard)
+                if self._guard_transition_handler(install_guard) is False:
+                    return
             else:
                 install_guard()
+            self._guard_ack_pending = False
         acknowledgment = UInt32()
         acknowledgment.data = sequence
         self._guard_ack_publisher.publish(acknowledgment)
 
     def _install_guard_values(self, sequence, guard_y, x_lt, z_gt) -> None:
-        if (
+        if sequence != self._guard_sequence and (
             self._guard_sequence < 0
             or sequence != (self._guard_sequence + 1) % (1 << 24)
         ):
