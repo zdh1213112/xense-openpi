@@ -42,6 +42,7 @@ class TurntableLease:
         self._collision_z_gt_m = 0.075
         self._post_place_fetch = False
         self._guard_sequence = -1
+        self._guard_mode = 2
         self._guard_last_at = 0.0
         self._placement_ready = False
         self._placement_ready_at = 0.0
@@ -146,6 +147,20 @@ class TurntableLease:
     @property
     def pick_guard_active(self) -> bool:
         return self.guard_max_y_m < self.safe_y_m - 1e-6
+
+    @property
+    def waiting_for_post_place_exit(self) -> bool:
+        """101 is stationary at startup and is reserving its next pick."""
+        return (
+            getattr(self, "_guard_mode", 2) == 3
+            and self._post_place_fetch
+            and self._guard_fresh()
+        )
+
+    @property
+    def pick_motion_guard_active(self) -> bool:
+        """Clamp execution only after the startup handoff has finished."""
+        return self.pick_guard_active and not self.waiting_for_post_place_exit
 
     @property
     def guard_command_y_m(self) -> float:
@@ -267,22 +282,26 @@ class TurntableLease:
             and 0.0 < guard_y <= self.safe_y_m + 1e-5
             and x_lt > 0.0
             and z_gt >= 0.0
-            and mode_value == 2.0
+            and mode_value in (2.0, 3.0)
+            and (mode_value != 3.0 or guard_y < self.safe_y_m)
         ):
             return
         self._guard_last_at = time.monotonic()
         ready_check = getattr(self, "_guard_ready_check", None)
         if ready_check is not None and not ready_check():
             with self._lease_lock:
-                self._install_guard_values(sequence, guard_y, x_lt, z_gt)
+                self._install_guard_values(sequence, guard_y, x_lt, z_gt, int(mode_value))
             self._guard_ack_pending = True
             return
         if sequence != self._guard_sequence or getattr(self, "_guard_ack_pending", False):
             self._guard_ack_pending = True
             def install_guard() -> None:
                 with self._lease_lock:
-                    self._install_guard_values(sequence, guard_y, x_lt, z_gt)
+                    self._install_guard_values(sequence, guard_y, x_lt, z_gt, int(mode_value))
 
+            install_guard.waiting_for_post_place_exit = (
+                mode_value == 3.0 and self._post_place_fetch
+            )
             if self._guard_transition_handler is not None:
                 # Drain the old async command before acknowledging the new
                 # protection state to 101.
@@ -295,7 +314,7 @@ class TurntableLease:
         acknowledgment.data = sequence
         self._guard_ack_publisher.publish(acknowledgment)
 
-    def _install_guard_values(self, sequence, guard_y, x_lt, z_gt) -> None:
+    def _install_guard_values(self, sequence, guard_y, x_lt, z_gt, mode=2) -> None:
         if sequence != self._guard_sequence and (
             self._guard_sequence < 0
             or sequence != (self._guard_sequence + 1) % (1 << 24)
@@ -309,6 +328,7 @@ class TurntableLease:
         self._collision_x_lt_m = x_lt
         self._collision_z_gt_m = z_gt
         self._guard_sequence = sequence
+        self._guard_mode = mode
 
     def _call(self, acquire: bool, *, ignore_stopping: bool = False) -> bool:
         if not self._client.wait_for_service(timeout_sec=0.2):

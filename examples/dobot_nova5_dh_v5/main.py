@@ -127,7 +127,7 @@ class Args:
     turntable_interlock: bool = False
     turntable_safe_y_m: float = 0.400
     # Advance the guarded Y command limit by 10 mm from the 101 boundary.
-    turntable_guard_y_margin_m: float = 0.010
+    turntable_guard_y_margin_m: float = 0.015
 
     # Image rendering
     render_height: int = 224

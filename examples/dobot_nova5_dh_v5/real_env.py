@@ -135,29 +135,56 @@ class DobotNova5DHRealEnv:
             if getattr(self, "_closing", False) or getattr(self.robot, "feedback_recovery_pending", False):
                 return False
             try:
+                # Mode 3 reserves the table while 101 remains at startup.
+                # Install it without interrupting the outgoing policy stream.
+                # Acknowledge only after measured position AND queued/sent
+                # Cartesian targets are outside the expanded danger volume.
+                if getattr(install_guard, "waiting_for_post_place_exit", False) is True:
+                    install_guard()
+                    if not self.robot.is_connected:
+                        return False
+                    current = self.robot.get_observation()
+                    actual = tuple(float(current[f"tcp.{axis}"]) for axis in "xyz")
+                    if not self.turntable_lease.collision_segment_clear(actual, actual):
+                        return False
+                    with self.robot._pause_action_worker(timeout_s=0.5):
+                        current = self.robot.get_observation()
+                        actual = tuple(float(current[f"tcp.{axis}"]) for axis in "xyz")
+                        previous = getattr(self.robot, "_latest_sent_async_action", None)
+                        if previous is not None:
+                            queued = tuple(float(previous[f"tcp.{axis}"]) for axis in "xyz")
+                            if not self.turntable_lease.collision_segment_clear(actual, queued):
+                                return False
+                        return self.turntable_lease.collision_segment_clear(actual, actual)
                 with self.robot._pause_action_worker(timeout_s=0.5):
                     install_guard()
                     if not (self.turntable_lease.pick_guard_active and self.robot.is_connected):
                         return True
-                    # A Servo command already sent by the worker can keep
-                    # moving after its queue is drained. Replace that target
-                    # with the measured current pose before acknowledging 101.
+                    # Preserve an already safe outgoing servo segment.
+                    # Unknown or hazardous sent targets must be replaced with
+                    # a measured hold before acknowledging the strict guard.
                     current = self.robot.get_observation()
-                    hold = {
-                        key: float(current[key])
-                        for key in (
-                            "tcp.x", "tcp.y", "tcp.z",
-                            *(f"tcp.r{i}" for i in range(1, 7)),
-                        )
-                    }
-                    hold["gripper.pos"] = self._gripper_hold_target(current)
-                    self.robot._send_action_sync(hold)
+                    actual = tuple(float(current[f"tcp.{axis}"]) for axis in "xyz")
+                    sent_target = getattr(self.robot, "_latest_sent_async_action", None)
+                    sent_clear = sent_target is not None and self.turntable_lease.collision_segment_clear(
+                        actual, tuple(float(sent_target[f"tcp.{axis}"]) for axis in "xyz")
+                    )
+                    if not sent_clear:
+                        sent_target = {
+                            key: float(current[key])
+                            for key in (
+                                "tcp.x", "tcp.y", "tcp.z",
+                                *(f"tcp.r{i}" for i in range(1, 7)),
+                            )
+                        }
+                        sent_target["gripper.pos"] = self._gripper_hold_target(current)
+                        self.robot._send_action_sync(sent_target)
                     self._latest_raw_obs = current
                     self._latest_raw_obs_at = time.monotonic()
                     self._latest_tcp_y = float(current["tcp.y"])
-                    self._last_target_tcp_x = float(current["tcp.x"])
-                    self._last_target_tcp_y = float(current["tcp.y"])
-                    self._last_target_tcp_z = float(current["tcp.z"])
+                    self._last_target_tcp_x = float(sent_target["tcp.x"])
+                    self._last_target_tcp_y = float(sent_target["tcp.y"])
+                    self._last_target_tcp_z = float(sent_target["tcp.z"])
                 return True
             except (StaleFeedbackError, TimeoutError) as exc:
                 self._begin_feedback_hold(exc)
@@ -204,6 +231,7 @@ class DobotNova5DHRealEnv:
                 f"policy_blocked={self.policy_blocked}, "
                 f"lease_held={lease.held if lease is not None else False}, "
                 f"guard_active={lease.pick_guard_active if lease is not None else False}, "
+                f"handoff_exit_wait={lease.waiting_for_post_place_exit if lease is not None else False}, "
                 f"actual XYZ=({raw_obs['tcp.x']:.3f},{raw_obs['tcp.y']:.3f},"
                 f"{raw_obs['tcp.z']:.3f})m; {self.robot.feedback_diagnostics()}"
             )
@@ -397,8 +425,6 @@ class DobotNova5DHRealEnv:
                 return False
             if not self._policy_blocked:
                 return True
-            if self.turntable_lease is not None and self.turntable_lease.pick_guard_active:
-                return False
             current = self._latest_raw_obs
             fresh = time.monotonic() - self._latest_raw_obs_at <= 0.10
             if current is None or not fresh:
@@ -409,8 +435,21 @@ class DobotNova5DHRealEnv:
             target = self._blocked_action
             if target is None:
                 return False
+            if self.turntable_lease is not None and self.turntable_lease.pick_motion_guard_active:
+                actual_xyz = tuple(float(current[f"tcp.{axis}"]) for axis in "xyz")
+                target_xyz = tuple(float(target[f"tcp.{axis}"]) for axis in "xyz")
+                prior_xyz = (
+                    self._last_target_tcp_x, self._last_target_tcp_y, self._last_target_tcp_z,
+                )
+                if not (
+                    self.turntable_lease.collision_segment_clear(actual_xyz, target_xyz)
+                    and self.turntable_lease.collision_segment_clear(prior_xyz, target_xyz)
+                ):
+                    return False
             if self.turntable_lease is not None and (
                 getattr(self, "_blocked_reason", None) == "pick_guard"
+                and not self.turntable_lease.waiting_for_post_place_exit
+                and not self.turntable_lease.pick_motion_guard_active
                 and not self.turntable_lease.fetch_x_point_clear(target["tcp.x"])
             ):
                 # A placement can first hit the 290 mm execution boundary,
@@ -538,7 +577,7 @@ class DobotNova5DHRealEnv:
                 self._refresh_after_resume = False
                 observation_fresh = True
 
-            if self.turntable_lease.pick_guard_active:
+            if self.turntable_lease.pick_motion_guard_active:
                 guard_y = self.turntable_lease.guard_max_y_m
                 guard_target_y = self.turntable_lease.guard_command_y_m
                 current_xyz = tuple(float(current.get(f"tcp.{axis}", float("nan")))
@@ -628,12 +667,12 @@ class DobotNova5DHRealEnv:
                 ):
                     stage_y = (
                         self.turntable_lease.guard_max_y_m
-                        if self.turntable_lease.pick_guard_active
+                        if self.turntable_lease.pick_motion_guard_active
                         else self.turntable_lease.safe_y_m
                     )
                     guard_target_y = (
                         self.turntable_lease.guard_command_y_m
-                        if self.turntable_lease.pick_guard_active
+                        if self.turntable_lease.pick_motion_guard_active
                         else stage_y - 0.005
                     )
                     if current_y > stage_y:

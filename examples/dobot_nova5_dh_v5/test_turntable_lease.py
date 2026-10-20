@@ -1265,3 +1265,131 @@ def test_heartbeat_continues_during_blocked_guard_transition_and_policy_stop():
             heartbeat_thread.join(timeout=2.0)
     assert not guard_thread.is_alive()
     assert not heartbeat_thread.is_alive()
+
+
+def exit_handoff_environment(y=0.302):
+    lease = lease_without_ros()
+    lease._post_place_fetch = True
+    lease._guard_max_y_m = .300
+    lease._guard_mode = 3
+    lease._guard_sequence = 42
+    env = paused_environment(lease, x=.485, y=y, z=.165)
+    env.robot.is_connected = True
+    env.robot._pause_action_worker = MagicMock(side_effect=lambda **_kw: nullcontext())
+    env.robot._send_action_sync = MagicMock()
+    env.robot._latest_sent_async_action = dict(env._latest_raw_obs)
+    return env, lease
+
+
+def test_post_place_exit_at_302_keeps_natural_vla_action_and_gripper():
+    env, lease = exit_handoff_environment()
+    action = np.asarray([.488, .296, .164, *([0.0] * 6), 1.0])
+    env.send_action(action)
+    sent = env.robot.send_action.call_args.args[0]
+    assert sent['tcp.y'] == pytest.approx(.296)
+    assert sent['tcp.x'] == pytest.approx(.488)
+    assert sent['gripper.pos'] == 1.
+    assert not env.policy_blocked
+    assert lease.pick_guard_active and not lease.pick_motion_guard_active
+
+
+def test_exit_phase_does_not_reissue_a_hold_or_ack_inside_collision_volume():
+    env, lease = exit_handoff_environment()
+    lease.set_guard_transition_handler(env._install_guard_after_worker_drain)
+    lease._guard_limit_callback(SimpleNamespace(data=[43., .300, .535, .075, 3.]))
+    assert lease.waiting_for_post_place_exit
+    lease._guard_ack_publisher.publish.assert_not_called()
+    env.robot._send_action_sync.assert_not_called()
+    env.robot._pause_action_worker.assert_not_called()
+
+
+def test_exit_ack_checks_measured_and_last_sent_trajectory_before_strict_guard():
+    env, lease = exit_handoff_environment(y=.280)
+    lease.set_guard_transition_handler(env._install_guard_after_worker_drain)
+    env.robot._latest_sent_async_action['tcp.y'] = .310
+    request = SimpleNamespace(data=[43., .300, .535, .075, 3.])
+    lease._guard_limit_callback(request)
+    lease._guard_ack_publisher.publish.assert_not_called()
+    env.robot._send_action_sync.assert_not_called()
+    env.robot._latest_sent_async_action['tcp.y'] = .275
+    lease._guard_limit_callback(request)
+    assert lease._guard_ack_publisher.publish.call_args.args[0].data == 43
+    assert not env.policy_blocked
+    env.robot._send_action_sync.assert_not_called()
+    lease._guard_limit_callback(SimpleNamespace(data=[44., .300, .535, .075, 2.]))
+    assert lease.pick_motion_guard_active
+    assert lease._guard_ack_publisher.publish.call_args.args[0].data == 44
+    # Strict installation preserves a known safe outgoing servo segment.
+    env.robot._send_action_sync.assert_not_called()
+    assert env._last_target_tcp_y == pytest.approx(.275)
+
+
+def test_mode_three_without_verified_post_place_phase_is_strict():
+    env, lease = exit_handoff_environment()
+    lease._post_place_fetch = False
+    assert not lease.waiting_for_post_place_exit
+    assert lease.pick_motion_guard_active
+
+
+def test_stale_exit_message_fails_closed_to_strict_protection():
+    env, lease = exit_handoff_environment()
+    lease._guard_last_at = time.monotonic() - .6
+    assert not lease.waiting_for_post_place_exit
+    assert lease.pick_motion_guard_active
+
+
+def test_exit_reservation_still_denies_a_new_placement_on_occupied_table():
+    env, lease = exit_handoff_environment(y=.390)
+    lease._client.service_is_ready.return_value = False
+    env.send_action(np.asarray([.488, .410, .164, *([0.0] * 6), 1.0]))
+    env.robot.send_action.assert_not_called()
+    assert env.policy_blocked
+
+
+def test_already_paused_outgoing_policy_can_resume_during_startup_handoff():
+    env, lease = exit_handoff_environment()
+    env._policy_blocked = True
+    env._blocked_reason = 'pick_guard'
+    env._blocked_action = dict(env._latest_raw_obs, **{'tcp.y': .280})
+    assert env.poll_policy_resume()
+    assert not env.policy_blocked
+    assert env._refresh_after_resume
+    lease._client.call_async.assert_not_called()
+
+
+def test_fetch_replans_and_continues_outside_volume_while_101_pick_guard_active():
+    env, lease = exit_handoff_environment(y=.395)
+    lease._guard_mode = 2
+    env._latest_raw_obs['tcp.x'] = .550
+    env._last_target_tcp_x = .550
+    env._policy_blocked = True
+    env._blocked_reason = 'fetch_staging'
+    env._blocked_action = dict(env._latest_raw_obs, **{'tcp.x': .560, 'tcp.y': .420})
+    assert lease.pick_motion_guard_active
+    assert env.poll_policy_resume()
+    assert not env.policy_blocked
+    lease._client.call_async.assert_not_called()
+
+
+def test_fetch_cannot_resume_if_its_sent_path_still_crosses_guarded_volume():
+    env, lease = exit_handoff_environment(y=.395)
+    lease._guard_mode = 2
+    env._latest_raw_obs['tcp.x'] = .550
+    env._last_target_tcp_x = .485
+    env._policy_blocked = True
+    env._blocked_reason = 'fetch_staging'
+    env._blocked_action = dict(env._latest_raw_obs, **{'tcp.x': .560, 'tcp.y': .420})
+    assert not env.poll_policy_resume()
+    assert env.policy_blocked
+
+
+def test_strict_handoff_holds_if_previously_sent_target_would_reenter_volume():
+    env, lease = exit_handoff_environment(y=.280)
+    env.robot._latest_sent_async_action['tcp.y'] = .310
+    lease.set_guard_transition_handler(env._install_guard_after_worker_drain)
+    lease._guard_limit_callback(SimpleNamespace(data=[43., .300, .535, .075, 2.]))
+    assert lease.pick_motion_guard_active
+    held = env.robot._send_action_sync.call_args.args[0]
+    assert held['tcp.y'] == pytest.approx(.280)
+    assert held['gripper.pos'] == 0.
+    assert lease._guard_ack_publisher.publish.call_args.args[0].data == 43
