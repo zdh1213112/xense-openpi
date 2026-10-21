@@ -129,6 +129,14 @@ class Args:
     # Advance the guarded Y command limit by 10 mm from the 101 boundary.
     turntable_guard_y_margin_m: float = 0.015
 
+    # Indication only. Reuses the existing interlock ROS node/camera threads.
+    alarm_light_enabled: bool = False
+    alarm_light_repeat_window_s: float = 15.0
+    alarm_light_repeat_position_span_m: float = 0.035
+    alarm_light_frame_max_age_s: float = 1.5
+    alarm_light_inference_failures: int = 3
+    alarm_light_starvation_s: float = 0.5
+
     # Image rendering
     render_height: int = 224
     render_width: int = 224
@@ -156,6 +164,22 @@ class Args:
 
 def main(args: Args) -> None:
     decoupled_mode = args.action_hz > 0
+    monitor = None
+    if args.alarm_light_enabled:
+        if not args.turntable_interlock:
+            raise ValueError("V5 alarm monitoring requires --args.turntable-interlock (existing ROS executor)")
+        from examples.dobot_nova5_dh_v5.station_monitor import (
+            MonitoredEnvironment, ObservedBroker, ObservedPolicy, VlaMonitor, report_only,
+        )
+        monitor = VlaMonitor(window_s=args.alarm_light_repeat_window_s,
+            position_span_m=args.alarm_light_repeat_position_span_m,
+            frame_age_s=args.alarm_light_frame_max_age_s,
+            failure_count=args.alarm_light_inference_failures,
+            starvation_s=args.alarm_light_starvation_s)
+        logger.info(
+            f"102 VLA alarm monitor enabled: repeat_window={args.alarm_light_repeat_window_s:.1f}s, "
+            f"repeat_position_span={args.alarm_light_repeat_position_span_m * 1000:.1f}mm; "
+            "normal interlock waits, warmup and operator stop are excluded")
 
     websocket_policy = _websocket_client_policy.WebsocketClientPolicy(
         host=args.host,
@@ -185,6 +209,9 @@ def main(args: Args) -> None:
         setup_robot=True,
     )
 
+    if monitor is not None:
+        base_environment = MonitoredEnvironment(base_environment, monitor)
+
     if args.dry_run:
         logger.info("DRY RUN mode: policy actions will be logged, not executed")
         environment = DryRunEnvironmentWrapper(base_environment)
@@ -194,8 +221,9 @@ def main(args: Args) -> None:
     effective_broker_hz = args.action_hz if decoupled_mode else args.runtime_hz
     if args.rtc_enabled:
         def policy_factory():
-            return rtc_action_chunk_broker.RTCActionChunkBroker(
-                policy=websocket_policy,
+            client = websocket_policy if monitor is None else ObservedPolicy(websocket_policy, monitor, monitor.begin_plan())
+            broker = rtc_action_chunk_broker.RTCActionChunkBroker(
+                policy=client,
                 frequency_hz=effective_broker_hz,
                 action_queue_size_to_get_new_actions=args.action_queue_size_to_get_new_actions,
                 rtc_enabled=True,
@@ -205,12 +233,15 @@ def main(args: Args) -> None:
                 dry_run=args.dry_run,
                 delta_state_dim=9,
             )
+            return broker if monitor is None else ObservedBroker(broker, monitor)
     else:
         def policy_factory():
-            return action_chunk_broker.ActionChunkBroker(
-                policy=websocket_policy,
+            client = websocket_policy if monitor is None else ObservedPolicy(websocket_policy, monitor, monitor.begin_plan())
+            broker = action_chunk_broker.ActionChunkBroker(
+                policy=client,
                 action_horizon=args.action_horizon,
             )
+            return broker if monitor is None else ObservedBroker(broker, monitor)
 
     # Feedback faults require a fresh plan even without the optional ROS lease.
     policy = InterlockedPolicy(policy_factory, base_environment)
@@ -278,6 +309,8 @@ def main(args: Args) -> None:
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt")
     except Exception as exception:
+        if monitor is not None:
+            report_only(monitor.terminal_error, exception)
         logger.error(f"Runtime error: {exception}")
         raise
     finally:
