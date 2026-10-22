@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import threading
+from typing import Literal
 
 
 def _ensure_ros_shared_libraries() -> None:
@@ -142,6 +143,16 @@ class Args:
     render_height: int = 224
     render_width: int = 224
 
+    # Optional remote Rerun 0.23 viewer; never spawns a viewer on this computer.
+    rerun_enabled: bool = False
+    rerun_host: str = "192.168.111.183"
+    rerun_port: int = 9876
+    rerun_hz: float = 5.0
+    rerun_jpeg_quality: int = 90
+    rerun_image_source: Literal["raw", "policy"] = "raw"
+    rerun_image_max_width: int = 1280
+    rerun_trail_seconds: float = 5.0
+
     # Runtime
     runtime_hz: float = 30.0
     num_episodes: int = 1
@@ -165,6 +176,22 @@ class Args:
 
 def main(args: Args) -> None:
     decoupled_mode = args.action_hz > 0
+    subscribers = []
+    if args.rerun_enabled:
+        from examples.dobot_nova5_dh_v5.rerun_subscriber import RemoteRerunSubscriber
+
+        subscribers.append(RemoteRerunSubscriber(
+            host=args.rerun_host, port=args.rerun_port, hz=args.rerun_hz,
+            jpeg_quality=args.rerun_jpeg_quality, dry_run=args.dry_run,
+            image_source=args.rerun_image_source, image_max_width=args.rerun_image_max_width,
+            trail_seconds=args.rerun_trail_seconds,
+        ))
+        logger.info(
+            f"V5 remote Rerun enabled: {args.rerun_host}:{args.rerun_port}, "
+            f"{args.rerun_hz:g} Hz, JPEG quality={args.rerun_jpeg_quality}; "
+            f"images={args.rerun_image_source}, max_width={args.rerun_image_max_width}, "
+            f"trail={args.rerun_trail_seconds:g}s"
+        )
     monitor = None
     if args.alarm_light_enabled:
         if not args.turntable_interlock:
@@ -263,7 +290,7 @@ def main(args: Args) -> None:
         runtime = _decoupled_runtime.DecoupledRuntime(
             environment=environment,
             broker=policy,
-            subscribers=[],
+            subscribers=subscribers,
             obs_hz=args.runtime_hz,
             action_hz=args.action_hz,
             num_episodes=args.num_episodes,
@@ -273,7 +300,7 @@ def main(args: Args) -> None:
         runtime = _runtime.Runtime(
             environment=environment,
             agent=_policy_agent.PolicyAgent(policy=policy),
-            subscribers=[],
+            subscribers=subscribers,
             max_hz=args.runtime_hz,
             num_episodes=args.num_episodes,
             max_episode_steps=args.max_episode_steps,
@@ -293,6 +320,8 @@ def main(args: Args) -> None:
             environment.disconnect()
         except Exception as exception:
             logger.warn(f"Error disconnecting Dobot Nova5 DH: {exception}")
+        for subscriber in subscribers:
+            subscriber.close()
 
     shutdown_in_progress = threading.Event()
 

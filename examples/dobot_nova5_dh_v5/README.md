@@ -230,6 +230,117 @@ mamba run -n lerobot-xense-v4 python -m examples.dobot_nova5_dh_v5.main \
 | `--args.no-go-to-home-on-disconnect` | - | 退出时不自动回 home |
 | `--args.action-hz` | `0` | 大于 0 时启用观测/动作解耦运行时 |
 
+## 在另一台电脑显示 Rerun（默认关闭）
+
+V5 可以把相机图像、10D 状态和 VLA 动作目标发送到局域网内的
+`192.168.111.183`。Rerun 窗口和渲染只在远端运行，本机不调用 `rr.spawn()`。
+两端使用 `rerun-sdk==0.23.1`；本机 `lerobot-xense-v4` 和远端
+`/home/p3/miniforge3/envs/loreal-lerobot` 已有该版本。需要在新环境补装时运行
+`python -m pip install rerun-sdk==0.23.1`。
+
+先在 **192.168.111.183 的图形桌面终端** 启动接收窗口：
+
+```bash
+/home/p3/vla-rerun/start-viewer.sh
+```
+
+该电脑已部署这个启动脚本。查看器关闭后可重新运行；接收端日志位于
+`/home/p3/vla-rerun/viewer.log`（通过 SSH 后台启动时）。窗口保留数据的内存上限
+为 1 GB，超过后丢弃最早的数据，不自动保存推理记录。
+
+其他查看电脑可以复制本目录的 `start_rerun_viewer.sh`，然后在其桌面终端运行：
+
+```bash
+RERUN_PYTHON=/path/to/python bash start_rerun_viewer.sh
+```
+
+然后在本机 **原 V5 推理命令末尾** 增加以下参数；原有服务地址、RTC、联锁和
+报警灯等参数照常保留：
+
+```bash
+    --args.rerun-enabled \
+    --args.rerun-host 192.168.111.183 \
+    --args.rerun-port 9876 \
+    --args.rerun-hz 5
+```
+
+
+```bash
+cd /home/zdh/xense-openpi
+mamba run -n lerobot-xense-v4 python -m examples.dobot_nova5_dh_v5.main \
+    --args.host <policy_server_ip> \
+    --args.port 8000 \
+    --args.runtime-hz 30 \
+    --args.rtc-enabled \
+    --args.turntable-interlock \
+    --args.alarm-light-enabled \
+    --args.rerun-enabled \
+    --args.rerun-host 192.168.111.183 \
+    --args.rerun-port 9876 \
+    --args.rerun-hz 5
+```
+
+```bash
+cd /home/zdh/xense-openpi
+
+mamba run -n lerobot-xense-v4 python -m examples.dobot_nova5_dh_v5.main \
+    --args.host <policy_server_ip> \
+    --args.port 8000 \
+    --args.runtime-hz 30 \
+    --args.rtc-enabled \
+    --args.turntable-interlock \
+    --args.alarm-light-enabled \
+    --args.rerun-enabled \
+    --args.rerun-host 192.168.111.183 \
+    --args.rerun-port 9876 \
+    --args.rerun-hz 5 \
+    --args.rerun-image-source raw \
+    --args.rerun-image-max-width 1280 \
+    --args.rerun-jpeg-quality 90 \
+    --args.rerun-trail-seconds 5
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `--args.rerun-enabled` | `False` | 开启远端可视化；不加此参数时不创建发送线程、不导入 Rerun SDK |
+| `--args.rerun-host` | `192.168.111.183` | 查看电脑 IP 或主机名 |
+| `--args.rerun-port` | `9876` | 查看电脑监听的 TCP 端口 |
+| `--args.rerun-hz` | `5` | 每秒最多采样次数，范围 `(0, 30]`；可改为 `2` 降低本机开销和带宽 |
+| `--args.rerun-jpeg-quality` | `90` | JPEG 质量，范围 `[1, 100]` |
+| `--args.rerun-image-source` | `raw` | 默认使用现有原始相机图像；`policy` 使用模型的小尺寸输入以降低开销 |
+| `--args.rerun-image-max-width` | `1280` | 可视化图像最大宽度，超过后在后台等比例缩小；不放大小图，范围 `[64, 4096]` |
+| `--args.rerun-trail-seconds` | `5` | 3D 拖尾保留最近多少秒，范围 `[0, 60]`；`0` 关闭拖尾 |
+
+界面默认显示现有 `head`、`wrist` 的原始相机图像（当前分别为 1280×720、
+640×480），JPEG 质量为 90；不再把 224×224 的模型输入放大显示。模型输入
+分辨率和推理处理保持原样。原始图像缺失的相机单独回退到对应的模型输入。
+也可设置 `--args.rerun-image-source policy` 恢复之前的小尺寸显示。
+
+3D 视图显示实测 TCP 点（蓝色）和 VLA 目标点（橙色），以及各自最近 5 秒的
+拖尾；越旧的线段越淡。拖尾随时间裁剪并限制点数，不会无限增长。切换 episode、
+断线或采样长时间中断后重建拖尾，不把未观测到的路径连成直线；保护等待时清除
+VLA 目标拖尾，TCP 拖尾继续显示。长度可用 `--args.rerun-trail-seconds 3`
+调整为最近 3 秒。
+
+另有 XYZ 曲线、夹爪状态/目标和保护等待标志。位置单位为米，
+采用现有机器人 User 0 / Tool 1 坐标。动作值是进入驱动限幅和联锁前的
+VLA 目标，不表示机械臂已实际到达；开启 `--args.dry-run` 时仍仅显示目标。
+夹爪状态沿用现有观测，默认关闭硬件位置轮询时是命令缓存；不显示实际夹持力。
+完整 6D 姿态分量也记录在 `state/rotation`、`action/rotation` 下，可在侧栏查看。
+
+发送复用现有观测，不额外打开相机、不读取机器人、不修改输入/动作。采样后
+只复制两张选定来源的相机图像和少量数值，等比例缩小、JPEG 压缩、拖尾计算、
+网络连接和发送均在后台。原图模式比原先的小图模式增加少量复制、编码和带宽开销；
+需要降低开销时，可设置 `--args.rerun-image-max-width 640`、
+`--args.rerun-jpeg-quality 80` 或 `--args.rerun-hz 2`。
+待发队列只保留最新一份，慢帧直接替换；断线时后台最多每秒探测一次，
+接收端恢复后继续发送最新数据。每次发送进行有超时的 SDK flush，避免离线
+数据持续堆积。发送异常限频提示，不中断 VLA；本机仍有少量复制、压缩和网络
+开销，并非完全零开销。普通、RTC、观测/动作解耦模式均使用同一个订阅器。
+
+首次启用需要重启 V5 客户端才能读取新开关；已运行的进程不会自动加载新代码。
+查看电脑需允许局域网访问 TCP 9876。
+
 
 ## V5 反馈与动作线程诊断
 
