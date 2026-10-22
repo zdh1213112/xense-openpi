@@ -481,3 +481,176 @@ def test_reporter_initialization_failure_keeps_existing_environment_available(mo
     assert env.reporter is None
     env.disconnect()
     inner.disconnect.assert_called_once_with()
+
+
+def feed_attempt_round(monitor, now, epoch, number, *, duration=3.0, down_fraction=.5,
+                       grip=0., direction=(.018, -.009, -.09), new_chunks=True):
+    # A drifting pickup approach/retreat, including retries that never close.
+    import math
+    start = now[0]
+    steps = math.ceil(duration / .25)
+    for index in range(steps + 1):
+        fraction = index / steps
+        now[0] = start + duration * fraction
+        if new_chunks and index % 2 == 0:
+            monitor.response(epoch, success=True)
+        approach = fraction / down_fraction if fraction <= down_fraction else (1 - fraction) / (1 - down_fraction)
+        state = list(pose(.50 + .006 * (number + fraction), grip=grip))
+        state[1] = .10 + .003 * (number + fraction)
+        state[2] = .25 + .018 * (number + fraction)
+        for axis in range(3):
+            state[axis] += direction[axis] * approach
+        monitor.target(state)
+        monitor.observe(state)
+
+
+@pytest.mark.parametrize('grip', [0., 1.])
+def test_three_drifting_attempts_warn_without_waiting_fifteen_seconds_or_requiring_gripper(grip):
+    monitor, now, epoch = ready_monitor()
+    for number, (duration, down) in enumerate(((3., .4), (3.6, .6), (2.8, .45))):
+        feed_attempt_round(monitor, now, epoch, number, duration=duration, down_fraction=down, grip=grip)
+        evidence = monitor.repeat_diagnostics()
+        assert evidence['attempt_rounds'] == number + 1
+        if number < 2:
+            assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+        else:
+            assert monitor.snapshot(captures(now[0]))[1] == 'vla102_repeated_motion'
+            assert evidence['gate'] == 'repeated_attempts'
+            assert evidence['attempts_required'] == 3
+            assert evidence['observed_s'] < 15 and max(evidence['xyz_span_mm']) > 35
+    # Lifting again in the same retry region is not task completion.
+    state = list(pose(.52, grip=grip))
+    state[2] = .34
+    now[0] += .25
+    monitor.target(state)
+    monitor.observe(state)
+    assert monitor.snapshot(captures(now[0]))[1] == 'vla102_repeated_motion'
+    monitor.progress()
+    assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+    assert monitor.repeat_diagnostics()['attempt_rounds'] == 0
+
+
+def test_three_round_count_is_not_three_directions_or_three_outbound_legs():
+    monitor, now, epoch = ready_monitor()
+    for index in range(45):
+        now[0] = index * .25
+        monitor.response(epoch, success=True)
+        state = list(pose(.5 + index * .003))
+        state[2] += index * .004
+        monitor.target(state)
+        monitor.observe(state)
+    assert monitor.repeat_diagnostics()['attempt_rounds'] == 0
+    assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+
+
+def test_unrelated_out_and_back_paths_do_not_accumulate_three_similar_attempts():
+    monitor, now, epoch = ready_monitor()
+    for number, direction in enumerate(((.1, 0., -.09), (-.1, 0., -.09), (0., .1, -.09))):
+        feed_attempt_round(monitor, now, epoch, number, direction=direction)
+        assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+    assert monitor.repeat_diagnostics()['attempt_rounds'] < 3
+
+
+@pytest.mark.parametrize('reset', ['progress', 'blocked', 'pause', 'new_plan', 'observation_gap', 'no_actions'])
+def test_attempt_rounds_do_not_bridge_progress_wait_pause_new_plan_or_data_gaps(reset):
+    monitor, now, epoch = ready_monitor()
+    for number in range(2):
+        feed_attempt_round(monitor, now, epoch, number)
+    assert monitor.repeat_diagnostics()['attempt_rounds'] == 2
+    if reset == 'progress':
+        monitor.progress()
+    elif reset == 'blocked':
+        monitor.context(blocked=True, reason='pick_guard')
+        monitor.context(blocked=False)
+    elif reset == 'pause':
+        monitor.context(stopping=True)
+        monitor.context(stopping=False)
+    elif reset == 'new_plan':
+        epoch = monitor.begin_plan()
+        monitor.mark_ready()
+    elif reset == 'observation_gap':
+        now[0] += 1.1
+    else:
+        now[0] += 1.1
+        monitor.observe(pose())  # Quiet feedback alone cannot complete another attempt.
+    feed_attempt_round(monitor, now, epoch, 2)
+    assert monitor.repeat_diagnostics()['attempt_rounds'] <= 1
+    assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+
+
+def test_attempts_inside_one_frozen_chunk_never_warn():
+    monitor, now, epoch = ready_monitor()
+    for number in range(3):
+        feed_attempt_round(monitor, now, epoch, number, new_chunks=False)
+    assert monitor.repeat_diagnostics()['attempt_rounds'] == 3
+    assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+
+
+def test_large_actual_departure_clears_attempt_warning_without_a_gripper_change():
+    monitor, now, epoch = ready_monitor()
+    for number in range(3):
+        feed_attempt_round(monitor, now, epoch, number)
+    assert monitor.snapshot(captures(now[0]))[0] == 'warning'
+    now[0] += .25
+    state = pose(.85)
+    monitor.target(state)
+    monitor.observe(state)
+    assert monitor.repeat_diagnostics()['attempt_rounds'] == 0
+    assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+
+
+def test_attempt_threshold_is_at_least_three_and_configurable():
+    monitor, now, epoch = ready_monitor(attempt_count=4)
+    for number in range(4):
+        feed_attempt_round(monitor, now, epoch, number)
+        assert (monitor.snapshot(captures(now[0]))[0] == 'warning') is (number == 3)
+    for invalid in (0, 1, 2, 3.5, True, float('nan')):
+        with pytest.raises(ValueError):
+            VlaMonitor(attempt_count=invalid)
+
+
+def test_attempts_do_not_accumulate_from_subcentimetre_feedback_noise():
+    monitor, now, epoch = ready_monitor(window_s=30.)
+    for index in range(48):
+        now[0] = index * .25
+        monitor.response(epoch, success=True)
+        state = pose(.5 + (.008 if index % 2 else -.008))
+        monitor.target(state)
+        monitor.observe(state)
+    assert monitor.repeat_diagnostics()['attempt_rounds'] == 0
+    assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+
+
+def test_three_slow_large_attempts_can_span_longer_than_the_old_window():
+    monitor, now, epoch = ready_monitor()
+    for number in range(3):
+        feed_attempt_round(monitor, now, epoch, number, duration=8.)
+        if number < 2:
+            assert monitor.snapshot(captures(now[0]))[0] == 'normal'
+    assert monitor.repeat_diagnostics()['attempt_elapsed_s'] > 15
+    assert monitor.repeat_diagnostics()['gate'] == 'repeated_attempts'
+    assert monitor.snapshot(captures(now[0]))[0] == 'warning'
+
+
+@pytest.mark.parametrize('phase', ['warmup', 'interlock_wait', 'paused'])
+def test_attempt_cycles_are_not_counted_during_excluded_phases(phase):
+    monitor, now, epoch = ready_monitor()
+    if phase == 'warmup':
+        epoch = monitor.begin_plan()
+    elif phase == 'interlock_wait':
+        monitor.context(blocked=True, reason='lease')
+    else:
+        monitor.context(stopping=True)
+    for number in range(3):
+        feed_attempt_round(monitor, now, epoch, number)
+    assert monitor.repeat_diagnostics()['attempt_rounds'] == 0
+    assert monitor.snapshot(captures(now[0]))[0] != 'warning'
+
+
+def test_repeated_attempt_warning_remains_below_existing_feedback_red_fault():
+    monitor, now, epoch = ready_monitor()
+    for number in range(3):
+        feed_attempt_round(monitor, now, epoch, number)
+    assert monitor.snapshot(captures(now[0]))[1] == 'vla102_repeated_motion'
+    monitor.context(feedback_fault=True)
+    assert monitor.snapshot(captures(now[0]))[0] == 'fault'

@@ -133,6 +133,7 @@ class Args:
     alarm_light_enabled: bool = False
     alarm_light_repeat_window_s: float = 15.0
     alarm_light_repeat_position_span_m: float = 0.035
+    alarm_light_repeat_attempts: int = 3
     alarm_light_frame_max_age_s: float = 1.5
     alarm_light_inference_failures: int = 3
     alarm_light_starvation_s: float = 0.5
@@ -173,12 +174,14 @@ def main(args: Args) -> None:
         )
         monitor = VlaMonitor(window_s=args.alarm_light_repeat_window_s,
             position_span_m=args.alarm_light_repeat_position_span_m,
+            attempt_count=args.alarm_light_repeat_attempts,
             frame_age_s=args.alarm_light_frame_max_age_s,
             failure_count=args.alarm_light_inference_failures,
             starvation_s=args.alarm_light_starvation_s)
         logger.info(
             f"102 VLA alarm monitor enabled: repeat_window={args.alarm_light_repeat_window_s:.1f}s, "
-            f"repeat_position_span={args.alarm_light_repeat_position_span_m * 1000:.1f}mm; "
+            f"repeat_position_span={args.alarm_light_repeat_position_span_m * 1000:.1f}mm, "
+            f"repeat_attempts={args.alarm_light_repeat_attempts}; "
             "normal interlock waits, warmup and operator stop are excluded")
 
     websocket_policy = _websocket_client_policy.WebsocketClientPolicy(

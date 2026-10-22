@@ -23,18 +23,23 @@
 
 监测只提示，不改变动作、夹爪或联锁：
 
-- 约 15 秒窗口内，跨至少三次新推理、至少十次实际交付动作，重复轨迹或
-  TCP 长期停留在每轴 35 mm 内、姿态各分量跨度小于 0.15，且没有 101
-  接受新鲜目标的交接进度证据，提示“疑似重复动作无进展”。持续输出相同
-  目标也计入；不再要求目标变化大于 4 mm 或夹爪反复开合。正常许可等待、
-  保护避让、预热和主动停机不计入窗口；并不能据此确诊空抓或掉料。
+- 连续识别到 3 轮相似的接近/退回或下降/抬升，且没有新的有效交接进度，
+  提示“疑似重复尝试且任务无进展”。前 1–2 轮不触发这项提醒；不要求合爪，
+  也不要求累计满 15 秒或全程处于每轴 35 mm 内。允许速度变化及逐轮小幅位置、
+  高度漂移；用相对 XYZ 轨迹匹配，每轴分别累计，不能把同一轮的三个轴算成三轮。
+  正常许可等待、保护避让、预热、主动停机、新计划或 101 接受新鲜目标的交接进度
+  会清除累计；明显离开原尝试区域也会解除。单次抬升、普通新推理块不是交接进度。
+- 原约 15 秒的小范围停滞和精确重复轨迹提醒继续保留：跨至少三次新推理、
+  十次交付动作，每轴 35 mm 内且姿态各分量跨度小于 0.15，或出现三次精确重复。
+  两种提醒只作疑似提示，并不能确诊空抓或掉料。
 - 连续三次推理失败，或 RTC 已预热后动作队列实际断供并等待超过 0.5 秒，
   提示等待恢复；不因队列低或普通推理延迟而报警。
 - 使用 RealSense 原生帧号/采集时间及返回图像对应的元数据核验帧龄，
   超过 1.5 秒提示视觉输入过期；不比较图片像素，不复制图像，不加采样线程。
 
 参数：`--args.alarm-light-repeat-window-s 15`、
-`--args.alarm-light-repeat-position-span-m 0.035`（每轴最大跨度，单位米）、
+`--args.alarm-light-repeat-position-span-m 0.035`（原小范围停滞每轴最大跨度，单位米）、
+`--args.alarm-light-repeat-attempts 3`（相似尝试轮数，整数且至少为 3）、
 `--args.alarm-light-frame-max-age-s 1.5`、
 `--args.alarm-light-inference-failures 3`、
 `--args.alarm-light-starvation-s 0.5`。重复动作阈值需要按现场最长正常动作标定。
@@ -45,8 +50,17 @@
 状态不变最多两秒一份小型 JSON，没有逐帧监测日志或图片落盘。
 启动时打印监测开关及阈值；状态变化时打印原因，其他时候约十秒记录一次
 `102 VLA monitor` 数值诊断。JSON 的 `repeat` 字段给出观察时长、新推理块数、
-交付动作数、实测 XYZ 跨度和判定阶段（如 `collecting_window`、`low_motion`），
-便于区分尚未满足窗口、正常移动和无进展提醒。35 mm 与 15 秒应按现场正常动作标定。
+交付动作数、实测 XYZ 跨度和判定阶段（如 `collecting_window`、`low_motion`、
+`repeated_attempts`）。`attempt_rounds` 是已匹配轮数，`attempts_required` 是门槛，
+`attempt_axis`、`attempt_elapsed_s`、`attempt_match_error_mm` 是累计方向、时长和轨迹差异。
+35 mm 与 15 秒仅约束原小范围停滞规则；新增三轮规则独立计数。
+
+一轮的保守识别依据：某轴去程至少 20 mm，回程至少为去程的 60% 且不少于 20 mm，
+反向迟滞 15 mm；单轮约 0.8–20 秒。按空间路程重采样比较轨迹，允许相邻轮起点
+漂移不超过 80 mm，并检查往返幅度、姿态变化和相对轨迹相似度；不把抬升高度或
+每帧方向变化单独当成一轮。仍需跨至少三次新推理、十次交付动作，有效反馈/动作
+采样断开超过约 1 秒会重新累计。更小的抖动仍由原 15 秒规则覆盖。
+这些数值应结合正常任务和真实卡住轨迹标定；无物料/抓取结果证据时只提示“疑似”。
 旧 broker 的迟到响应、旧会话消息不会清除新会话的警示。进程停止更新但
 ROS 发布端仍在时，灯控不会凭静默推断新的故障，原安全联锁继续生效。
 
@@ -188,6 +202,18 @@ mamba run -n lerobot-xense-v4 python -m examples.dobot_nova5_dh_v5.main \
     --args.runtime-hz 30 \
     --args.rtc-enabled \
     --args.turntable-interlock
+```
+
+
+```bash
+cd /home/zdh/xense-openpi
+mamba run -n lerobot-xense-v4 python -m examples.dobot_nova5_dh_v5.main \
+    --args.host <policy_server_ip> \
+    --args.port 8000 \
+    --args.runtime-hz 30 \
+    --args.rtc-enabled \
+    --args.turntable-interlock \
+    --args.alarm-light-enabled
 ```
 
 常用参数：
